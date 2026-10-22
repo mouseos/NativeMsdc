@@ -17,6 +17,13 @@
 // Writes are bounded multi-block writes (CMD23 + CMD25) that return only when the card is back in the transfer
 // state. Forced unit access (the store, and window writes that ask for it) adds a FLUSH_CACHE when the card cache
 // is on, so the data is on the medium when the request completes.
+//
+// NATIVE_MSDC_BLOCK_DEVICES (default 1) builds the window block devices. They subclass the original
+// IOBlockStorageDevice of the prelinked IOStorageFamily, so the kernel link needs the storage bindings
+// (build-native-virtio-bindings.py). With 0 the driver serves the persistent store only and links on its own.
+#ifndef NATIVE_MSDC_BLOCK_DEVICES
+#define NATIVE_MSDC_BLOCK_DEVICES 1
+#endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -24,7 +31,9 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IODeviceTreeSupport.h>
+#if NATIVE_MSDC_BLOCK_DEVICES
 #include <IOKit/storage/IOBlockStorageDevice.h>
+#endif
 #include <libkern/c++/OSData.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSIterator.h>
@@ -609,6 +618,7 @@ bool hostFindLayout (const char **why)
 
 } // namespace
 
+#if NATIVE_MSDC_BLOCK_DEVICES
 // ---- Window block devices --------------------------------------------------------------------------------------------
 
 class NativeMsdcBlock : public IOBlockStorageDevice {
@@ -715,12 +725,15 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
   completion->action (completion->target, completion->parameter, result, done * kSector);
   return kIOReturnSuccess;
 }
+#endif // NATIVE_MSDC_BLOCK_DEVICES
 
 // ---- Controller service ----------------------------------------------------------------------------------------------
 
 class NativeMsdc : public IOService {
   OSDeclareDefaultStructors (NativeMsdc)
+#if NATIVE_MSDC_BLOCK_DEVICES
   bool startRoot (bool allowWrites, const char **why);
+#endif
 public:
   IOService *probe (IOService *provider, SInt32 *score) override;
   bool start (IOService *provider) override;
@@ -728,6 +741,7 @@ public:
 };
 OSDefineMetaClassAndStructors (NativeMsdc, IOService)
 
+#if NATIVE_MSDC_BLOCK_DEVICES
 namespace {
 
 NativeMsdcBlock *gPending[kMaxWindows];
@@ -827,6 +841,7 @@ void publishThread (void *, wait_result_t)
 }
 
 } // namespace
+#endif // NATIVE_MSDC_BLOCK_DEVICES
 
 IOService *NativeMsdc::probe (IOService *provider, SInt32 *score)
 {
@@ -841,7 +856,6 @@ bool NativeMsdc::start (IOService *provider)
   unsigned root = bootArgument ("native-msdc-root", 2, 0);
   unsigned persist = bootArgument ("native-msdc-persist", 2, 0);
   unsigned dma = bootArgument ("native-msdc-dma", 1, 0);
-  gVerifyWindows = bootArgument ("native-msdc-verify", 1, 0) == 1;
   if (!root && !persist) return false;   // matched only; the controller is not touched
   if (gHost.base) {
     IOLog ("NativeMsdc: one controller only; %s ignored\n", provider->getName ());
@@ -856,10 +870,18 @@ bool NativeMsdc::start (IOService *provider)
     return false;
   }
   if (!gHost.manifestValid) fail (manifestReason (native_msdc_manifest_status));
-  else if (root && !startRoot (root == 2, &why)) fail (why);
+#if NATIVE_MSDC_BLOCK_DEVICES
+  else if (root) {
+    gVerifyWindows = bootArgument ("native-msdc-verify", 1, 0) == 1;
+    if (!startRoot (root == 2, &why)) fail (why);
+  }
+#else
+  else if (root) fail ("native-msdc-root: built without the window block devices (NATIVE_MSDC_BLOCK_DEVICES=0)");
+#endif
   return true;
 }
 
+#if NATIVE_MSDC_BLOCK_DEVICES
 bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 {
   if (!buildRootPlan (gHost.manifest, gPlan)) {
@@ -899,6 +921,7 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
   native_msdc_step = 5;
   return true;
 }
+#endif // NATIVE_MSDC_BLOCK_DEVICES
 
 void NativeMsdc::stop (IOService *provider)
 {

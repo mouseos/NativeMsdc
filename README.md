@@ -72,6 +72,13 @@ are exported for boot pages and panic reports. Messages go to `IOLog` with the p
 flags and the IOStorageFamily headers (`build/storage-abi/include`) into `build/native-msdc/libNativeMsdc.a`.
 `scripts/build-xnu-4k-baseline.sh` links it and compiles the personality when `XNU_NATIVE_MSDC=1`.
 
+The window block devices subclass the original `IOBlockStorageDevice` of the prelinked IOStorageFamily. As for the
+other block transports, the kernel link then needs the audited aliases of that class:
+`build-native-virtio-bindings.py --component NativeMsdc --directory build/native-msdc` (input:
+`build/storage-abi/interface-audit.json`). A board without that audit compiles with `NATIVE_MSDC_BLOCK_DEVICES=0`: the
+driver then serves the persistent store only, references no original storage symbol and links on its own;
+`native-msdc-root` reports that the windows were not built.
+
 ## Credits
 
 - Command sequences, register bits, descriptor DMA and the GPT handling: `bsd/dev/a04br3_msdc.c` and
