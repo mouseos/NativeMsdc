@@ -338,4 +338,164 @@ static inline bool dmaDescriptors (DmaGpd *gpd, DmaBd *bd, uint64_t gpdPhys, uin
   return true;
 }
 
+// ---- Signed root policy region (used when built with NATIVE_VERIFIED_BLOCK=1) ---------------------------------------
+// The owner-signed VerifiedRoot policies of the root windows live in userdata, after the windows:
+//
+//   Location: the end of the SHNGROOT window that ends farthest into userdata (its offset + size, bytes from the start
+//             of userdata; with the windows in ascending order this is the last window), rounded up to a 1 MiB
+//             boundary. See policyRegionOffset().
+//
+//   Layout, little endian, offsets from the start of the region:
+//     0      char[8]  magic "A04RPOL1"
+//     8      u32      version = 1
+//     12     u32      count of entries, 1..16
+//     16     u64      total_bytes: the whole region, this 4096-byte header included
+//     24     count x { u64 offset (from the start of the region), u64 bytes }   (16 bytes each)
+//     ...    unused up to 4064, ignored (write zero)
+//     4064   SHA-256 of the 4096-byte header computed with these 32 bytes taken as zero
+//
+//   Each entry is one VROOT01 envelope exactly as kits/VerifiedRoot/tools/manifest.py writes it (160-byte header,
+//   384-byte owner signature, SHA-256 table of the 4096-byte blocks). Entries lie in [4096, total_bytes) and do not
+//   overlap. total_bytes is at most 256 MiB and the region must fit in userdata.
+//
+// The header hash only catches a torn, stale or misplaced region. Trust comes from vr_open: the owner signature over
+// each envelope under the independently linked key. A window is served only through the one entry whose signed
+// image size equals the window size; no entry or two such entries refuse the window.
+constexpr uint64_t kPolicyAlign = 1024 * 1024;
+constexpr unsigned kPolicyHeaderBytes = 4096;
+constexpr unsigned kPolicyHashed = 4064;
+constexpr unsigned kPolicyMaxEntries = 16;
+constexpr uint64_t kPolicyMaxBytes = 256ULL * 1024 * 1024;
+constexpr uint64_t kPolicyEnvelopeMinBytes = 160 + 384;   // VR_HEADER_BYTES + VR_SIGNATURE_BYTES
+constexpr uint64_t kVerifiedBlock = 4096;                  // VR_BLOCK_BYTES
+
+struct PolicyEntry { uint64_t offset, bytes; };
+struct PolicyHeader {
+  uint64_t totalBytes;
+  unsigned count;
+  PolicyEntry entry[kPolicyMaxEntries];
+};
+
+enum PolicyStatus : unsigned {
+  kPolicyOk = 0, kPolicyNoMagic = 1, kPolicyVersion = 2, kPolicyHash = 3, kPolicySize = 4, kPolicyEntryBounds = 5,
+  kPolicyEntryOverlap = 6,
+};
+
+// Byte offset of the policy region from the start of userdata.
+static inline uint64_t policyRegionOffset (const RootManifest &manifest)
+{
+  uint64_t end = 0;
+  for (unsigned i = 0; i < manifest.count && i < kMaxWindows; ++i) {
+    uint64_t windowEnd = manifest.window[i].offset + manifest.window[i].size;
+    if (windowEnd > end) end = windowEnd;
+  }
+  return (end + kPolicyAlign - 1) & ~(kPolicyAlign - 1);
+}
+
+// header: the first 4096 bytes of the region; digest: SHA-256 of them with bytes 4064..4095 taken as zero (computed by
+// the caller); available: bytes of userdata from the start of the region to the end of the partition.
+static inline unsigned parsePolicyHeader (const uint8_t *header, const uint8_t *digest, uint64_t available,
+                                          PolicyHeader &policy)
+{
+  policy = {};
+  if (memcmp (header, "A04RPOL1", 8)) return kPolicyNoMagic;
+  uint32_t version = le32 (header + 8), count = le32 (header + 12);
+  uint64_t total = le64 (header + 16);
+  if (version != 1 || !count || count > kPolicyMaxEntries) return kPolicyVersion;
+  if (memcmp (digest, header + kPolicyHashed, 32)) return kPolicyHash;
+  if (total < kPolicyHeaderBytes || total > kPolicyMaxBytes || ((total + kSector - 1) & ~uint64_t (kSector - 1)) > available)
+    return kPolicySize;
+  for (uint32_t index = 0; index < count; ++index) {
+    uint64_t offset = le64 (header + 24 + 16 * index), bytes = le64 (header + 32 + 16 * index);
+    if (offset < kPolicyHeaderBytes || offset > total || bytes < kPolicyEnvelopeMinBytes || bytes > total - offset)
+      return kPolicyEntryBounds;
+    for (uint32_t prior = 0; prior < index; ++prior) {
+      const PolicyEntry &other = policy.entry[prior];
+      if (offset < other.offset + other.bytes && other.offset < offset + bytes) return kPolicyEntryOverlap;
+    }
+    policy.entry[index] = { offset, bytes };
+  }
+  policy.totalBytes = total;
+  policy.count = count;
+  return kPolicyOk;
+}
+
+// The signed image size of a VROOT01 envelope (header byte 24). Unauthenticated: used only to choose the entry that
+// vr_open then authenticates and whose authenticated image size must equal the window again.
+static inline uint64_t policyImageBytes (const uint8_t *envelope) { return le64 (envelope + 24); }
+
+enum PolicySelect : unsigned { kPolicySelected = 0, kPolicyNoMatch = 1, kPolicyDuplicate = 2 };
+
+// region: the whole region as read (policy parsed from it). Picks the one entry whose image size is windowBytes.
+static inline unsigned selectPolicy (const uint8_t *region, const PolicyHeader &policy, uint64_t windowBytes,
+                                     unsigned &selected)
+{
+  unsigned matches = 0;
+  for (unsigned index = 0; index < policy.count; ++index) {
+    if (policyImageBytes (region + policy.entry[index].offset) != windowBytes) continue;
+    selected = index;
+    ++matches;
+  }
+  return matches == 1 ? kPolicySelected : matches ? kPolicyDuplicate : kPolicyNoMatch;
+}
+
+// ---- Verified window read ----------------------------------------------------------------------------------------
+// Serves 512-byte sectors [block, block + count) of a window of windowBytes from whole 4096-byte integrity blocks:
+// each chunk of at most bounceBytes is read into bounce, every block in it verified (the last block of the window may
+// be shorter than 4096, a multiple of 512), and only then the requested bytes copied out. The lock is held across
+// read, verify and copy so the verified snapshot is the one copied. Ops provides
+//   void lock (), void unlock ()
+//   int read (uint64_t windowSector, uint32_t sectors, uint8_t *out)      0 on success
+//   int verify (uint64_t blockIndex, const uint8_t *data, size_t length)  0 on success
+//   uint64_t copy (uint64_t requestOffset, const uint8_t *data, uint64_t length)  bytes copied
+//   int badArgument (), int ioError ()
+// done counts the bytes delivered to the caller before the first failure.
+struct VerifiedReadResult { int status; uint64_t done; };
+
+template <class Ops>
+static inline VerifiedReadResult verifiedReadWindow (Ops &ops, uint64_t windowBytes, uint64_t block, uint64_t count,
+                                                     uint8_t *bounce, uint64_t bounceBytes)
+{
+  if (!bounce || bounceBytes < kVerifiedBlock || (bounceBytes % kVerifiedBlock) || !windowBytes ||
+      (windowBytes % kSector) || !count || block >= windowBytes / kSector || count > windowBytes / kSector - block)
+    return { ops.badArgument (), 0 };
+  VerifiedReadResult result = { 0, 0 };
+  uint64_t start = block * kSector, remaining = count * kSector;
+  ops.lock ();
+  while (remaining) {
+    uint64_t position = start + result.done;
+    uint64_t first = position / kVerifiedBlock, skip = position % kVerifiedBlock;
+    uint64_t blocks = (skip + remaining + kVerifiedBlock - 1) / kVerifiedBlock;
+    if (blocks > bounceBytes / kVerifiedBlock) blocks = bounceBytes / kVerifiedBlock;
+    uint64_t base = first * kVerifiedBlock;
+    uint64_t chunk = blocks * kVerifiedBlock;
+    if (chunk > windowBytes - base) chunk = windowBytes - base;      // the window's short last block
+    result.status = ops.read (base / kSector, uint32_t (chunk / kSector), bounce);
+    if (result.status) break;
+    for (uint64_t index = 0; index < blocks; ++index) {
+      uint64_t offset = index * kVerifiedBlock;
+      if (offset >= chunk) {
+        result.status = ops.badArgument ();
+        break;
+      }
+      uint64_t length = chunk - offset < kVerifiedBlock ? chunk - offset : kVerifiedBlock;
+      result.status = ops.verify (first + index, bounce + offset, size_t (length));
+      if (result.status) break;
+    }
+    if (result.status) break;
+    uint64_t usable = chunk - skip;
+    if (usable > remaining) usable = remaining;
+    uint64_t copied = ops.copy (result.done, bounce + skip, usable);
+    if (copied != usable) {
+      if (copied < usable) result.done += copied;
+      result.status = ops.ioError ();
+      break;
+    }
+    result.done += usable;
+    remaining -= usable;
+  }
+  ops.unlock ();
+  return result;
+}
+
 } // namespace NativeMsdcHw

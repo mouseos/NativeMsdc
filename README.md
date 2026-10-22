@@ -50,6 +50,45 @@ becomes a `NativeMsdcBlock` (`IOBlockStorageDevice`, 512-byte blocks). SystemOS 
 OS last; each window before OS waits up to 30 s for its APFS volume, so SystemOS is present when the root mounts.
 XNU then selects the root through `/chosen/root-matching`.
 
+## Verified root (NATIVE_VERIFIED_BLOCK=1)
+
+iPadOS APFS requires the root volume to be authenticated (`rootvp not authenticated after mounting` otherwise). Built
+with `-DNATIVE_VERIFIED_BLOCK=1` and `kits/VerifiedRoot/include` (`build-arm-driver.py NativeMsdc --verified-root`),
+the windows are served only through owner-signed VerifiedRoot policies. The default build is unchanged and does not
+verify. This is independent of `native-msdc-verify`, which compares whole windows with the manifest SHA-256.
+
+The policies are stored in userdata after the windows, at the end of the window that ends farthest into userdata
+rounded up to 1 MiB:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 8 | magic `A04RPOL1` |
+| 8 | 4 | version, 1 |
+| 12 | 4 | count of entries, 1..16 |
+| 16 | 8 | total_bytes, the whole region including the header, at most 256 MiB |
+| 24 | 16 x count | entries: u64 offset from the start of the region, u64 bytes |
+| 4064 | 32 | SHA-256 of the 4096-byte header with these 32 bytes taken as zero |
+
+All fields are little endian. Each entry is one VROOT01 envelope as written by `kits/VerifiedRoot/tools/manifest.py`;
+entries lie in [4096, total_bytes) and do not overlap.
+
+Before publishing, the publisher thread reads the whole region into kernel memory (`kmem_alloc`, `KMA_KOBJECT |
+KMA_DATA`), checks the header again from that copy, appends a copy of `verified_root_key` and makes both read-only
+with `vm_map_protect`. For each window it selects the one entry whose image size equals the window size (none or
+two refuse the window) and opens it with `vr_open` (minimum generation 1, `vr_xnu_crypto`). Only a window whose
+envelope opens and whose signed image size equals the window is published; the reason for any other is logged and the
+window is discarded. The publication order stays SystemOS first and OS last.
+
+A verified window reads whole 4096-byte blocks of the window (the last one may be shorter), checks each with
+`vr_verify_block` and only then copies the requested sectors. A block that fails returns `kIOReturnNotPrivileged` and
+counts in `native_msdc_integrity_failures`. Writes are refused. `native_ufs_block_authenticates` (the weak import of
+NativeVirtioBlock's root authorization) is defined for these windows: -1 for another provider, 1 when the UUID is the
+signed volume UUID, otherwise 0; it also returns the SHA-384 of the authenticated envelope, as NativeUfs does. NativeUfs
+defines the same symbol, so a kernel links only one of the two verified drivers. The link needs `verified_root_key`,
+`vr_open`, `vr_verify_block` and `vr_xnu_crypto` from a separate archive.
+
+The persistent store stays clear of 256 MiB after the policy region start in this build.
+
 ## Persistent store
 
 NativeRamBlock persists the Data volume's changed pages through a store window (PersistOverlay.h). NativeMsdc
@@ -64,7 +103,14 @@ symbols.
 ## Diagnostics
 
 `native_msdc_step`, `native_msdc_failure`, `native_msdc_manifest_status`, `native_msdc_dma` and the transfer counters
-are exported for boot pages and panic reports. Messages go to `IOLog` with the prefix `NativeMsdc:`.
+are exported for boot pages and panic reports, and with the verified root `native_msdc_policy_status`,
+`native_msdc_verified_windows`, `native_msdc_verified_blocks` and `native_msdc_integrity_failures`. Messages go to
+`IOLog` with the prefix `NativeMsdc:`.
+
+## Tests
+
+`tests/run.sh` builds and runs the host tests of the pure logic in `NativeMsdc.h` (policy region location and header,
+policy selection, verified window reads including the short last block) with AddressSanitizer and UBSan.
 
 ## Build
 

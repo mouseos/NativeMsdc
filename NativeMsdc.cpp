@@ -21,8 +21,23 @@
 // NATIVE_MSDC_BLOCK_DEVICES (default 1) builds the window block devices. They subclass the original
 // IOBlockStorageDevice of the prelinked IOStorageFamily, so the kernel link needs the storage bindings
 // (build-native-virtio-bindings.py). With 0 the driver serves the persistent store only and links on its own.
+//
+// NATIVE_VERIFIED_BLOCK=1 (default off, needs the window block devices) serves the windows only through the
+// owner-signed VerifiedRoot policies stored after them in userdata (layout in NativeMsdc.h, "Signed root policy
+// region"). Before publishing, the publisher thread reads the whole region into read-only kernel memory; each window is
+// published only if exactly one policy has its size and vr_open accepts it under verified_root_key. Every read is then
+// served from whole 4096-byte blocks that passed vr_verify_block, writes are refused, and native_ufs_block_authenticates
+// answers the root authorization of NativeVirtioBlock for these windows. Independent of native-msdc-verify.
 #ifndef NATIVE_MSDC_BLOCK_DEVICES
 #define NATIVE_MSDC_BLOCK_DEVICES 1
+#endif
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+#define NATIVE_MSDC_VERIFIED 1
+#if !NATIVE_MSDC_BLOCK_DEVICES
+#error "NATIVE_VERIFIED_BLOCK=1 needs the window block devices (NATIVE_MSDC_BLOCK_DEVICES=1)"
+#endif
+#else
+#define NATIVE_MSDC_VERIFIED 0
 #endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
@@ -43,6 +58,15 @@
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <pexpert/pexpert.h>
+#if NATIVE_MSDC_VERIFIED
+#include <vm/vm_kern.h>
+#include <vm/vm_map.h>
+#include "verified_root.h"
+extern "C" {
+extern const struct vr_crypto vr_xnu_crypto;     // kits/VerifiedRoot/adapters/xnu_crypto.c
+extern const uint8_t verified_root_key[];         // the owner key, VR_KEY_BYTES, linked separately
+}
+#endif
 #include "NativeMsdc.h"
 
 using namespace NativeMsdcHw;
@@ -55,6 +79,12 @@ volatile uint32_t native_msdc_manifest_status = 0xffffffff;
 volatile uint32_t native_msdc_dma = 0;                      // 0 PIO, 1 DMA verified, 2 DMA rejected, 3 quarantined
 volatile uint32_t native_msdc_blocks_published = 0;
 volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flushes = 0, native_msdc_failures = 0;
+// Signed root policy (NATIVE_VERIFIED_BLOCK): header status (PolicyStatus, 0xffffffff not read), windows that passed
+// vr_open, verified 4096-byte blocks served and integrity failures.
+volatile uint32_t native_msdc_policy_status = 0xffffffff;
+volatile uint32_t native_msdc_verified_windows = 0;
+volatile uint64_t native_msdc_verified_blocks = 0;
+volatile uint32_t native_msdc_integrity_failures = 0;
 }
 
 namespace {
@@ -621,6 +651,125 @@ bool hostFindLayout (const char **why)
 #if NATIVE_MSDC_BLOCK_DEVICES
 // ---- Window block devices --------------------------------------------------------------------------------------------
 
+#if NATIVE_MSDC_VERIFIED
+// ---- Signed root policy region -----------------------------------------------------------------------------------------
+namespace {
+
+// The region as read from userdata, then made read-only, followed by a read-only copy of the owner key on its own page.
+// vr_open requires both to stay immutable for as long as the views opened on them are used: the windows never free it.
+struct PolicyStore {
+  vm_offset_t storage;
+  vm_size_t storageBytes;
+  const uint8_t *key;
+  PolicyHeader header;
+};
+PolicyStore gPolicy;
+
+void policyDigest (const uint8_t *header, uint8_t digest[32])
+{
+  static const uint8_t zero[32] = {};
+  SHA256_CTX context;
+  SHA256_Init (&context);
+  SHA256_Update (&context, header, kPolicyHashed);
+  SHA256_Update (&context, zero, sizeof (zero));
+  SHA256_Final (digest, &context);
+}
+
+const char *policyReason (unsigned status)
+{
+  switch (status) {
+  case kPolicyNoMagic: return "no A04RPOL1 policy region after the root windows";
+  case kPolicyVersion: return "policy version or entry count";
+  case kPolicyHash: return "policy header SHA-256 mismatch";
+  case kPolicySize: return "policy region size";
+  case kPolicyEntryBounds: return "policy entry bounds";
+  case kPolicyEntryOverlap: return "policy entries overlap";
+  default: return "policy region rejected";
+  }
+}
+
+void freePolicy (void)
+{
+  if (gPolicy.storage) kmem_free (kernel_map, gPolicy.storage, gPolicy.storageBytes);
+  gPolicy = {};
+}
+
+// Reads the whole region into kernel memory, checks its header again from that copy and makes it read-only.
+// Returns nullptr or the reason the region is unusable.
+const char *loadPolicy (void)
+{
+  uint64_t partitionBytes = (gHost.gpt.userdataLast - gHost.gpt.userdataFirst + 1) * kSector;
+  uint64_t start = policyRegionOffset (gHost.manifest);
+  if (start >= partitionBytes || partitionBytes - start < kPolicyHeaderBytes) return "policy region outside userdata";
+  uint64_t available = partitionBytes - start, firstSector = gHost.gpt.userdataFirst + start / kSector;
+  PolicyHeader header;
+  unsigned status;
+  uint8_t digest[32];
+  {
+    HostSession session;
+    if (transfer (firstSector, kPolicyHeaderBytes / kSector, gHost.bounce, false) != kIOReturnSuccess)
+      return "policy header read failed";
+    policyDigest (gHost.bounce, digest);
+    status = parsePolicyHeader (gHost.bounce, digest, available, header);
+  }
+  native_msdc_policy_status = status;
+  if (status != kPolicyOk) return policyReason (status);
+  vm_size_t tableBytes = round_page (static_cast<vm_size_t> (header.totalBytes));
+  vm_size_t keyBytes = round_page (static_cast<vm_size_t> (VR_KEY_BYTES));
+  vm_offset_t storage = 0;
+  if (kmem_alloc (kernel_map, &storage, tableBytes + keyBytes, static_cast<kma_flags_t> (KMA_KOBJECT | KMA_DATA),
+                  VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS)
+    return "policy allocation";
+  gPolicy.storage = storage;
+  gPolicy.storageBytes = tableBytes + keyBytes;
+  uint8_t *region = reinterpret_cast<uint8_t *> (storage);
+  IOLog ("NativeMsdc: reading the signed root policy, %llu bytes at userdata +%llu\n", header.totalBytes, start);
+  uint64_t began = mach_absolute_time ();
+  uint64_t sectors = (header.totalBytes + kSector - 1) / kSector;
+  for (uint64_t done = 0; done < sectors;) {
+    uint32_t blocks = sectors - done > kMaxBlocks ? kMaxBlocks : uint32_t (sectors - done);
+    HostSession session;
+    if (transfer (firstSector + done, blocks, region + done * kSector, false) != kIOReturnSuccess) {
+      freePolicy ();
+      return "policy region read failed";
+    }
+    done += blocks;
+  }
+  uint64_t elapsed = 0;
+  absolutetime_to_nanoseconds (mach_absolute_time () - began, &elapsed);
+  // The header is taken from the copy that the envelopes are opened from, and must describe the same region.
+  policyDigest (region, digest);
+  status = parsePolicyHeader (region, digest, available, gPolicy.header);
+  native_msdc_policy_status = status;
+  if (status != kPolicyOk || gPolicy.header.totalBytes != header.totalBytes) {
+    freePolicy ();
+    return status != kPolicyOk ? policyReason (status) : "policy region changed while it was read";
+  }
+  uint8_t *key = region + tableBytes;
+  memcpy (key, verified_root_key, VR_KEY_BYTES);
+  if (vm_map_protect (kernel_map, storage, storage + tableBytes + keyBytes, VM_PROT_READ, TRUE) != KERN_SUCCESS) {
+    freePolicy ();
+    return "policy read-only protection";
+  }
+  gPolicy.key = key;
+  IOLog ("NativeMsdc: signed root policy read in %llu ms, %u entries\n", elapsed / 1000000ULL, gPolicy.header.count);
+  return nullptr;
+}
+
+const char *vrReason (int status)
+{
+  switch (status) {
+  case VR_FORMAT: return "policy envelope format or generation";
+  case VR_KEY: return "policy envelope is for another owner key";
+  case VR_SIGNATURE: return "policy owner signature invalid";
+  case VR_HASH_TABLE: return "policy block hash table does not match its signed digest";
+  default: return "policy envelope rejected";
+  }
+}
+
+} // namespace
+#endif // NATIVE_MSDC_VERIFIED
+
 class NativeMsdcBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeMsdcBlock)
   uint64_t firstSector = 0;   // absolute, 512-byte sectors
@@ -629,8 +778,21 @@ class NativeMsdcBlock : public IOBlockStorageDevice {
   char label[32] = {};
   bool writable = false;
   bool online = false;
+#if NATIVE_MSDC_VERIFIED
+  bool verifiedActive = false;
+  struct vr_view verified = {};
+  const uint8_t *envelope = nullptr;    // the selected VROOT01 envelope in the read-only policy copy
+  uint8_t *verifiedBounce = nullptr;    // kTransferBytes, under verifiedLock from read through copy
+  IOLock *verifiedLock = nullptr;
+  IOReturn readVerified (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion *completion);
+#endif
 public:
   bool configure (unsigned index, const RootWindow &entry, uint64_t absoluteSector, bool allowWrites);
+#if NATIVE_MSDC_VERIFIED
+  const char *configureVerification (int *status);
+  bool authenticatesVolume (const char *uuid, uint8_t *manifestDigest) const;
+  void free () override;
+#endif
   const char *windowLabel () const { return label; }
   unsigned windowIndex () const { return window; }
   bool start (IOService *provider) override;
@@ -700,6 +862,13 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
   IODirection direction = buffer->getDirection ();
   bool write = direction == kIODirectionOut;
   if (!write && direction != kIODirectionIn) return kIOReturnBadArgument;
+#if NATIVE_MSDC_VERIFIED
+  if (verifiedActive) {
+    if (write) return kIOReturnNotWritable;     // a verified window is served read-only
+    if (!online) return kIOReturnNotReady;
+    return readVerified (buffer, block, count, completion);
+  }
+#endif
   if (write && !writable) return kIOReturnNotWritable;
   if (!online) return kIOReturnNotReady;
   bool forceUnitAccess = write && attributes && (attributes->options & kIOStorageOptionForceUnitAccess);
@@ -725,6 +894,125 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
   completion->action (completion->target, completion->parameter, result, done * kSector);
   return kIOReturnSuccess;
 }
+
+#if NATIVE_MSDC_VERIFIED
+// Selects this window's policy and opens it (vr_open, owner key, minimum generation 1). Returns nullptr when the window
+// is to be served verified, otherwise the reason it must not be published; *status gets the vr_open result or -1.
+const char *NativeMsdcBlock::configureVerification (int *status)
+{
+  *status = -1;
+  if (!gPolicy.storage || !gPolicy.key) return "no signed root policy";
+  const uint8_t *region = reinterpret_cast<const uint8_t *> (gPolicy.storage);
+  uint64_t windowBytes = sectors * kSector;
+  unsigned index = 0;
+  switch (selectPolicy (region, gPolicy.header, windowBytes, index)) {
+  case kPolicySelected: break;
+  case kPolicyDuplicate: return "two policy entries have this window's size";
+  default: return "no policy entry has this window's size";
+  }
+  const PolicyEntry &entry = gPolicy.header.entry[index];
+  struct vr_view view = {};
+  *status = vr_open (region + entry.offset, static_cast<size_t> (entry.bytes), gPolicy.key, 1, &vr_xnu_crypto, &view);
+  if (*status != VR_OK) return vrReason (*status);
+  if (view.image_bytes != windowBytes) return "signed image size differs from the window";
+  verifiedBounce = static_cast<uint8_t *> (IOMalloc (kTransferBytes));
+  verifiedLock = IOLockAlloc ();
+  if (!verifiedBounce || !verifiedLock) return "verified read buffers";
+  verified = view;
+  envelope = region + entry.offset;
+  writable = false;
+  verifiedActive = true;
+  return nullptr;
+}
+
+IOReturn NativeMsdcBlock::readVerified (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+                                        IOStorageCompletion *completion)
+{
+  struct Operations {
+    IOLock *mutex;
+    IOMemoryDescriptor *buffer;
+    const vr_view *view;
+    uint64_t firstSector;
+    void lock () { IOLockLock (mutex); }
+    void unlock () { IOLockUnlock (mutex); }
+    int badArgument () { return kIOReturnBadArgument; }
+    int ioError () { return kIOReturnIOError; }
+    int read (uint64_t windowSector, uint32_t blocks, uint8_t *out)
+    {
+      HostSession session;
+      return transfer (firstSector + windowSector, blocks, out, false);
+    }
+    int verify (uint64_t index, const uint8_t *data, size_t length)
+    {
+      if (vr_verify_block (view, index, data, length, &vr_xnu_crypto) != VR_OK) {
+        __atomic_fetch_add (&native_msdc_integrity_failures, 1, __ATOMIC_RELAXED);
+        native_msdc_failure = "window block failed its signed hash";
+        return kIOReturnNotPrivileged;
+      }
+      __atomic_fetch_add (&native_msdc_verified_blocks, 1, __ATOMIC_RELAXED);
+      return kIOReturnSuccess;
+    }
+    uint64_t copy (uint64_t offset, const uint8_t *data, uint64_t length)
+    {
+      return buffer->writeBytes (offset, data, length);
+    }
+  } operations = { verifiedLock, buffer, &verified, firstSector };
+  VerifiedReadResult outcome = verifiedReadWindow (operations, sectors * kSector, block, count, verifiedBounce,
+                                                   kTransferBytes);
+  if (outcome.status == kIOReturnNotPrivileged)
+    IOLog ("NativeMsdc: %s: read of sectors %llu+%llu refused, a block failed its signed hash\n", label, block, count);
+  completion->action (completion->target, completion->parameter, outcome.status, outcome.done);
+  return kIOReturnSuccess;
+}
+
+// True when uuid is the volume UUID signed into this window's policy. digest (48 bytes, optional) receives the SHA-384
+// of the authenticated envelope (header, signature and hash table), as NativeUfs reports it.
+bool NativeMsdcBlock::authenticatesVolume (const char *uuid, uint8_t *manifestDigest) const
+{
+  if (!uuid || !online || !verifiedActive || !envelope || !verified.hashes) return false;
+  static const char hex[] = "0123456789ABCDEF";
+  char expected[37];
+  unsigned at = 0;
+  for (unsigned i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) expected[at++] = '-';
+    expected[at++] = hex[verified.volume_uuid[i] >> 4];
+    expected[at++] = hex[verified.volume_uuid[i] & 15];
+  }
+  expected[at] = 0;
+  if (strcmp (uuid, expected)) return false;
+  if (manifestDigest) {
+    const uint64_t envelopeBytes = VR_HEADER_BYTES + VR_SIGNATURE_BYTES + verified.block_count * 32;
+    SHA384_CTX context;
+    SHA384_Init (&context);
+    SHA384_Update (&context, envelope, envelopeBytes);
+    SHA384_Final (manifestDigest, &context);
+  }
+  return true;
+}
+
+void NativeMsdcBlock::free ()
+{
+  if (verifiedBounce) {
+    IOFree (verifiedBounce, kTransferBytes);
+    verifiedBounce = nullptr;
+  }
+  if (verifiedLock) {
+    IOLockFree (verifiedLock);
+    verifiedLock = nullptr;
+  }
+  IOBlockStorageDevice::free ();
+}
+
+// The root authorization of NativeVirtioBlock (native_verified_block_root_authorized) asks every provider of the root
+// media through this weak import: -1 when provider is not an eMMC window, else 1 if its signed volume UUID is uuid and
+// 0 if not. NativeUfs defines the same symbol for its windows; a kernel links one of the two.
+extern "C" int native_ufs_block_authenticates (IOService *provider, const char *uuid, uint8_t *digest)
+{
+  NativeMsdcBlock *block = OSDynamicCast (NativeMsdcBlock, provider);
+  if (!block) return -1;
+  return block->authenticatesVolume (uuid, digest) ? 1 : 0;
+}
+#endif // NATIVE_MSDC_VERIFIED
 #endif // NATIVE_MSDC_BLOCK_DEVICES
 
 // ---- Controller service ----------------------------------------------------------------------------------------------
@@ -808,6 +1096,29 @@ void discardPending (unsigned index)
 // resolvable when the root mounts. A window that fails its hash or its start is not published; the rest continue.
 void publishThread (void *, wait_result_t)
 {
+#if NATIVE_MSDC_VERIFIED
+  // Every window needs its signed policy before it is published; the region is read here, off the matching thread,
+  // since it is tens of MiB. A window without an accepted policy is discarded and never published.
+  const char *policyFailure = loadPolicy ();
+  if (policyFailure) IOLog ("NativeMsdc: signed root policy unusable: %s; no window is published\n", policyFailure);
+  unsigned verifiedWindows = 0;
+  for (unsigned index = 0; index < gHost.manifest.count; ++index) {
+    NativeMsdcBlock *device = gPending[index];
+    if (!device) continue;
+    int status = -1;
+    const char *why = policyFailure ? policyFailure : device->configureVerification (&status);
+    if (why) {
+      IOLog ("NativeMsdc: %s not published: %s (vr_open %d)\n", device->windowLabel (), why, status);
+      native_msdc_failure = why;
+      discardPending (index);
+      continue;
+    }
+    IOLog ("NativeMsdc: %s verified against its signed policy\n", device->windowLabel ());
+    ++verifiedWindows;
+  }
+  native_msdc_verified_windows = verifiedWindows;
+  if (!verifiedWindows) freePolicy ();
+#endif
   for (unsigned position = 0; position < gPlan.count; ++position) {
     unsigned index = gPlan.order[position];
     NativeMsdcBlock *device = gPending[index];
@@ -977,9 +1288,15 @@ extern "C" int native_msdc_store_open (uint64_t blocks, uint64_t *firstSector, c
   else {
     HostSession session;
     uint64_t first = 0;
+    // The store also stays clear of the space the signed root policy region may use after the windows.
+    uint64_t protectedBytes = gHost.manifest.imageBytes;
+#if NATIVE_MSDC_VERIFIED
+    if (policyRegionOffset (gHost.manifest) + kPolicyMaxBytes > protectedBytes)
+      protectedBytes = policyRegionOffset (gHost.manifest) + kPolicyMaxBytes;
+#endif
     if (gStoreBlocks) reason = "already open";
     else if (const char *refused = storeWindow (gHost.gpt.userdataLast - gHost.gpt.userdataFirst + 1,
-                                                gHost.manifest.imageBytes, reserveBlocks (), blocks, first))
+                                                protectedBytes, reserveBlocks (), blocks, first))
       reason = refused;
     else {
       gStoreFirstSector = gHost.gpt.userdataFirst + first * kSectorsPerStoreBlock;
