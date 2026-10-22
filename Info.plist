@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>org.blu-sharky.NativeMsdc</string>
+  <key>CFBundleName</key><string>NativeMsdc</string>
+  <key>CFBundleExecutable</key><string>NativeMsdc</string>
+  <key>CFBundlePackageType</key><string>KEXT</string>
+  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>OSBundleRequired</key><string>Root</string>
+  <key>IOKitPersonalities</key><dict><key>MediaTek MT8167 MSDC eMMC</key><dict>
+    <key>IOClass</key><string>NativeMsdc</string>
+    <key>IOProviderClass</key><string>IOPlatformDevice</string>
+    <key>IOProbeScore</key><integer>1000</integer>
+  </dict></dict>
+</dict></plist>
