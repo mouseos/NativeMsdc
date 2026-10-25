@@ -163,3 +163,16 @@ window lock; reconfigured/offline reads fail before I/O or copying. A failed liv
 reconfiguration leaves the verified window offline rather than falling back to
 unauthenticated reads. A04BR3 optionally reports nonzero aggregate counters on
 its existing process-report thread, no more often than once per 60 seconds.
+
+### Optional root startup timing
+
+`native-root-timing=1` (exactly 1, default off) enables atomic cumulative
+`native_msdc_verified_timing_stats[6]`: read calls, requested read bytes,
+read nanoseconds, verify calls, verify bytes, verify nanoseconds. Read time
+includes host-lock wait, transport/cache maintenance and bounce copying;
+verify time covers `vr_verify_block` only. Failed attempts are counted.
+Disabled operations read no clock and update no timing counters. There is no
+per-I/O timing log. `native_root_timing_snapshot` supplies an optional aggregate
+snapshot to the kernel's separate default-off shared-region timing diagnostics.
+These are system-wide intervals, not per-PID CPU attribution. Cache hits do not
+perform or count a new transport read/hash. Test: `sh tests/run-timing.sh`.

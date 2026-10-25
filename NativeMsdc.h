@@ -450,6 +450,22 @@ static inline unsigned selectPolicy (const uint8_t *region, const PolicyHeader &
 //   uint64_t copy (uint64_t requestOffset, const uint8_t *data, uint64_t length)  bytes copied
 //   int badArgument (), int ioError ()
 // done counts the bytes delivered to the caller before the first failure.
+// Default-off timing: disabled calls execute only the original operation, with
+// no clock reads or counter updates. Counts/bytes include failed attempts.
+template <class Clock, class Operation>
+static inline int verifiedTimedOperation (bool enabled, volatile uint64_t *stats, unsigned base,
+                                          uint64_t bytes, Clock now, Operation operation)
+{
+  if (!enabled) return operation ();
+  uint64_t begin = now ();
+  int result = operation ();
+  uint64_t elapsed = now () - begin;
+  __atomic_fetch_add (&stats[base], 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&stats[base + 1], bytes, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&stats[base + 2], elapsed, __ATOMIC_RELAXED);
+  return result;
+}
+
 // One authenticated snapshot in the existing 64 KiB bounce buffer. Callers hold
 // their window lock for invalidation, lookup and fill. No Data/overlay caller.
 struct VerifiedReadKey {

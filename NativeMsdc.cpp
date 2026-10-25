@@ -81,6 +81,14 @@ volatile uint32_t native_msdc_blocks_published = 0;
 volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flushes = 0, native_msdc_failures = 0;
 // Optional verified-root snapshot reuse: hits, misses, authenticated bytes reused.
 volatile uint64_t native_msdc_verified_cache_stats[3] = {};
+// read calls/requested bytes/ns, verify calls/bytes/ns; no hot-path logging.
+volatile uint64_t native_msdc_verified_timing_stats[6] = {};
+void native_root_timing_snapshot (uint64_t out[6])
+{
+  for (unsigned i = 0; i < 6; ++i)
+    out[i] = __atomic_load_n (&native_msdc_verified_timing_stats[i], __ATOMIC_RELAXED);
+}
+
 
 // Signed root policy (NATIVE_VERIFIED_BLOCK): header status (PolicyStatus, 0xffffffff not read), windows that passed
 // vr_open, verified 4096-byte blocks served and integrity failures.
@@ -130,6 +138,16 @@ inline void wr (unsigned offset, uint32_t value)
   *reinterpret_cast<volatile uint32_t *> (gHost.base + offset) = value;
   __asm__ volatile ("dsb sy" ::: "memory");
 }
+
+#if NATIVE_MSDC_VERIFIED
+bool gRootTimingEnabled; // configured once before window publication
+uint64_t rootTimingNow ()
+{
+  uint64_t ns = 0;
+  absolutetime_to_nanoseconds (mach_absolute_time (), &ns);
+  return ns;
+}
+#endif
 
 uint64_t deadlineAfter (uint64_t nanoseconds)
 {
@@ -1008,12 +1026,18 @@ IOReturn NativeMsdcBlock::readVerified (IOMemoryDescriptor *buffer, UInt64 block
     int read (uint64_t windowSector, uint32_t blocks, uint8_t *out)
     {
       if (!owner->verifiedActive || !owner->online) return kIOReturnNotReady;
-      HostSession session;
-      return transfer (firstSector + windowSector, blocks, out, false);
+      // Includes shared host-lock wait, DMA/cache maintenance and bounce copy.
+      return verifiedTimedOperation (gRootTimingEnabled, native_msdc_verified_timing_stats, 0,
+        uint64_t (blocks) * kSector, rootTimingNow, [&] () {
+          HostSession session;
+          return transfer (firstSector + windowSector, blocks, out, false);
+        });
     }
     int verify (uint64_t index, const uint8_t *data, size_t length)
     {
-      if (vr_verify_block (view, index, data, length, &vr_xnu_crypto) != VR_OK) {
+      const int checked = verifiedTimedOperation (gRootTimingEnabled, native_msdc_verified_timing_stats, 3,
+        length, rootTimingNow, [&] () { return vr_verify_block (view, index, data, length, &vr_xnu_crypto); });
+      if (checked != VR_OK) {
         __atomic_fetch_add (&native_msdc_integrity_failures, 1, __ATOMIC_RELAXED);
         native_msdc_failure = "window block failed its signed hash";
         return kIOReturnNotPrivileged;
@@ -1233,6 +1257,9 @@ IOService *NativeMsdc::probe (IOService *provider, SInt32 *score)
 
 bool NativeMsdc::start (IOService *provider)
 {
+#if NATIVE_MSDC_VERIFIED
+  gRootTimingEnabled = bootArgument ("native-root-timing", 1, 0) == 1;
+#endif
   unsigned root = bootArgument ("native-msdc-root", 2, 0);
   unsigned persist = bootArgument ("native-msdc-persist", 2, 0);
   unsigned dma = bootArgument ("native-msdc-dma", 1, 0);
