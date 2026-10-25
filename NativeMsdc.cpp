@@ -127,6 +127,7 @@ struct MsdcHost {
   bool manifestValid;
 };
 MsdcHost gHost;
+bool gModeTelemetryEnabled; // exact native-msdc-mode=1, sampled once before bring-up
 
 inline uint32_t rd (unsigned offset)
 {
@@ -453,6 +454,41 @@ void fail (const char *why)
   IOLog ("NativeMsdc: %s\n", why);
 }
 
+// Diagnostic reads only: no card command, clock/pad write, new transfer, reset,
+// retune or mode transition. EXT_CSD is the already successful 512-byte CMD8.
+// TOPCKGEN address/mux [13:11] are documented by the MT8167 Linux/EDK2 sources.
+// A selector alone does not prove the live PLL/source frequency.
+// EXT_CSD[183] is not readable: retain raw bytes only, never infer card
+// width/DDR or agreement with the host. HS_TIMING[185] is readable.
+void hostLogMode (const uint8_t *extCsd, uint32_t inheritedCfg)
+{
+  if (!gModeTelemetryEnabled) return;
+  uint32_t cfg = rd (kMsdcCfg), io = rd (kMsdcIoCon), sdc = rd (kSdcCfg);
+  uint32_t pad0 = rd (kPadTune0), pad1 = rd (kPadTune1);
+  BusMode mode = decodeBusMode (cfg, sdc, extCsd[185]);
+  uint32_t muxReg = 0;
+  bool muxValid = false;
+  IODeviceMemory *clockMemory = IODeviceMemory::withRange (0x10000000ULL, 0x1000);
+  IOMemoryMap *clockMap = clockMemory ? clockMemory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  if (clockMap && clockMap->getLength () >= sizeof (uint32_t) && clockMap->getVirtualAddress ()) {
+    muxReg = *reinterpret_cast<volatile uint32_t *> (uintptr_t (clockMap->getVirtualAddress ()));
+    muxValid = true;
+  }
+  OSSafeReleaseNULL (clockMap);
+  OSSafeReleaseNULL (clockMemory);
+  // Keep every newline-terminated record below the 255-byte console buffer.
+  IOLog ("NativeMsdc: mode raw inherited=%08x cfg=%08x iocon=%08x sdc=%08x pad0=%08x pad1=%08x\n",
+         inheritedCfg, cfg, io, sdc, pad0, pad1);
+  IOLog ("NativeMsdc: mode host ckmod=%u ckdiv=%u stable=%u bits=%u ddr=%u hs400clk=%u\n",
+         mode.clockMode, mode.clockDivider, unsigned (mode.clockStable), mode.hostBits,
+         unsigned (mode.hostDdr), unsigned ((cfg >> 22) & 1u));
+  IOLog ("NativeMsdc: mode card rev=%u bus_width_raw=%02x bus_width=not_readable hs_timing=%02x card_type=%02x driver_strength=%02x timing=%u\n",
+         unsigned (extCsd[192]), unsigned (extCsd[183]), unsigned (extCsd[185]), unsigned (extCsd[196]),
+         unsigned (extCsd[197]), mode.cardTiming);
+  IOLog ("NativeMsdc: mode source mux_valid=%u mux_reg=%08x msdc0_mux=%u source_hz=unmeasured\n",
+         unsigned (muxValid), muxReg, muxValid ? (muxReg >> 11) & 7u : 255u);
+}
+
 // ---- Bring-up --------------------------------------------------------------------------------------------------------
 
 bool listHas (OSObject *property, const char *wanted)
@@ -581,7 +617,8 @@ bool hostBringUp (IOService *provider, bool useDma, const char **why)
     return false;
   }
   gHost.base = static_cast<uintptr_t> (gHost.map->getVirtualAddress ());
-  IOLog ("NativeMsdc: controller 0x%llx inherited CFG=0x%08x STS=0x%08x\n", phys, rd (kMsdcCfg), rd (kSdcSts));
+  const uint32_t inheritedCfg = rd (kMsdcCfg);
+  IOLog ("NativeMsdc: controller 0x%llx inherited CFG=0x%08x STS=0x%08x\n", phys, inheritedCfg, rd (kSdcSts));
   HostSession session;
   uint32_t response = 0;
   if (hostCommand (kCmdStatus, kStatusArgument, Data::None, &response) != kIOReturnSuccess || !cardInTransfer (response)) {
@@ -602,6 +639,7 @@ bool hostBringUp (IOService *provider, bool useDma, const char **why)
     *why = "EXT_CSD: no capacity or a boot/RPMB partition selected";
     return false;
   }
+  hostLogMode (extCsd, inheritedCfg);
   if (useDma) hostEnableDma ();
   if (gHost.poisoned) {
     *why = "DMA engine did not stop";
@@ -1264,6 +1302,7 @@ bool NativeMsdc::start (IOService *provider)
   unsigned persist = bootArgument ("native-msdc-persist", 2, 0);
   unsigned dma = bootArgument ("native-msdc-dma", 1, 0);
   if (!root && !persist) return false;   // matched only; the controller is not touched
+  gModeTelemetryEnabled = bootArgument ("native-msdc-mode", 1, 0) == 1;
   if (gHost.base) {
     IOLog ("NativeMsdc: one controller only; %s ignored\n", provider->getName ());
     return false;

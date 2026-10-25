@@ -176,3 +176,50 @@ per-I/O timing log. `native_root_timing_snapshot` supplies an optional aggregate
 snapshot to the kernel's separate default-off shared-region timing diagnostics.
 These are system-wide intervals, not per-PID CPU attribution. Cache hits do not
 perform or count a new transport read/hash. Test: `sh tests/run-timing.sh`.
+
+### Optional inherited bus-mode telemetry
+
+`native-msdc-mode=1` (exactly 1, default off) emits four newline-terminated
+records, each below 200 bytes, once during successful controller bring-up.
+It reads controller CFG/IOCON/SDC_CFG/PAD_TUNE0/1 and the existing successful
+CMD8 EXT_CSD buffer: BUS_WIDTH[183], HS_TIMING[185], revision[192],
+CARD_TYPE[196] and DRIVER_STRENGTH[197]. CARD_TYPE is capability, not active
+mode. BUS_WIDTH[183] is not readable: its raw byte is retained only and labelled
+`not_readable`; card width, card DDR and host/card width agreement are unknown
+and are not derived. Reserved controller width encodings report 0 bits.
+HS_TIMING[185] is readable; its raw byte and low timing nibble are reported.
+Reference: official mmc-utils commit
+`4afc8c81685825461677311e79059cda15fba9d8`, `mmc_cmds.c:1018-1020`,
+which prints HS_TIMING[185] and explicitly marks BUS_WIDTH[183] not readable.
+
+A temporary read-only TOPCKGEN mapping reports register 0x10000000 and the
+MSDC0 mux selector [13:11]; mapping failure is diagnostic-only. No register is
+written and no extra card command/read, reset, tuning or mode transition is
+performed. The mapping is released before logging. Absent/invalid flags perform
+none of these extra reads, mappings or logs. Existing transport/verification
+counters remain controlled by `native-root-timing=1`; no duplicate timing path
+is added. Test: `python3 tests/check-mode-telemetry.py` (actual helper extraction,
+strict gate, literal decoding, allocation/map failures and console bounds).
+
+Register evidence: MT8167 vendor Linux 4.4
+`drivers/mmc/host/mediatek/mt8167/msdc_reg.h`, `sd.c:msdc_set_mclk`, and
+`drivers/clk/mediatek/clk-mt8167.c:msdc0_parents` / `CLK_TOP_MSDC0_SEL`.
+CFG 0x02000199 means CKMOD=0, CKDIV=1, clock-stable=1; it does not establish
+source frequency or bus width. The MT8167-specific clock-parent table, rather
+than a generic MSDC source-frequency table, applies. Live PLL frequency remains
+unmeasured and is explicitly reported as such.
+
+The A04BR3 EDK2 `SdCardBlockIoDxe.c:SdTuneTransferMode` reference configures
+8-bit SDR, HS_TIMING=1 and requests 52 MHz. Its configured 188 MHz source and
+`SdSetClock` divider imply 47 MHz, conditional on that source actually being
+188 MHz. This is source configuration evidence, not a measurement of the
+current inherited LK state. Vendor Linux also implements DDR52/HS200/HS400,
+but changes sampling/tuning paths (`msdc_init_tune_path`, autok/CMD21), beyond
+clock-divider changes. No higher-speed transition is implemented here: first
+capture controller width, readable card timing and mux, then qualify a complete supported transition
+with baseline/candidate byte comparison before publication. Existing DMA/PIO
+comparison and publication rules remain unchanged.
+
+Measured whole-file `vn_rdwr` throughput is not card-link bandwidth. Compare
+its interval with the existing same-boot transport and verified-root SHA
+counters; APFS/VM and other caller work remain outside those driver counters.

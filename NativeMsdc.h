@@ -13,6 +13,9 @@ namespace NativeMsdcHw {
 
 // ---- Registers (offsets from the MSDC base) ---------------------------------------------------------------------
 enum : unsigned {
+  kMsdcIoCon = 0x04, // sampling configuration, telemetry read only
+  kSdcCfg = 0x30,    // BUSWIDTH [17:16], telemetry read only
+  kPadTune0 = 0xf0, kPadTune1 = 0xf4, // MT8167 tuning registers, telemetry read only
   kMsdcCfg = 0x00,     // MSDC_CFG: bit 3 PIO mode
   kMsdcIntr = 0x0c,    // MSDC_INT: write 1 to clear
   kMsdcIntEn = 0x10,   // MSDC_INTEN
@@ -49,6 +52,21 @@ constexpr uint32_t kDmaCtrlBurst64 = 6u << 12;
 constexpr uint32_t kDmaCfgActive = 1u << 0;
 constexpr uint32_t kDmaCfgChecksum = 1u << 1;
 constexpr unsigned kFifoBytes = 128;
+
+// Pure decoding of MT8167 controller fields and existing CMD8 EXT_CSD bytes.
+// Clock source rate is intentionally not guessed from a mux selector or throughput.
+struct BusMode {
+  unsigned clockMode, clockDivider, hostBits, cardTiming;
+  bool clockStable, hostDdr;
+};
+constexpr BusMode decodeBusMode (uint32_t cfg, uint32_t sdc, uint8_t timing)
+{
+  unsigned host = (sdc >> 16) & 3u;
+  unsigned hostBits = host == 0 ? 1 : host == 1 ? 4 : host == 2 ? 8 : 0;
+  unsigned mode = (cfg >> 20) & 3u;
+  return { mode, (cfg >> 8) & 0xfffu, hostBits, unsigned (timing & 15u),
+           (cfg & (1u << 7)) != 0, mode == 2 || mode == 3 };
+}
 
 // ---- eMMC ---------------------------------------------------------------------------------------------------------
 constexpr unsigned kSector = 512;
