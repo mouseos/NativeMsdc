@@ -132,3 +132,34 @@ driver then serves the persistent store only, references no original storage sym
   MT8167 eMMC driver of [mouseos/edk2-mtk](https://github.com/mouseos/edk2-mtk).
 - Structure, manifest rules, publication order and the store interface: NativeUfs and NativeRamBlock of
   [UniXNU](https://github.com/UniXNU/UniXNU).
+
+### Optional authenticated root snapshot cache
+
+`native-msdc-vcache=1` (exact value 1; absent/other values disable it) enables
+reuse of the last fully authenticated chunk, at most 64 KiB, in each verified
+read-only manifest window. Requires the existing `NATIVE_VERIFIED_BLOCK=1` build.
+No board default or signed policy changes are needed. Data/overlay and writable
+manifest windows are excluded. The existing per-window lock protects the bounce
+buffer and cache state; no new cache lock or allocation is used.
+
+Keys include manifest window identity, absolute first sector, window size,
+configuration epoch, signed policy generation and the current bounce buffer.
+Every miss invalidates before reading; only a completely verified chunk becomes
+valid. Writes (including refused/invalid write requests with an output buffer)
+and all reconfiguration attempts invalidate first. Padding is never cached.
+
+The exported `native_msdc_verified_cache_stats[3]` contains aggregate cache hits,
+misses and authenticated bytes reused, respectively. These are cumulative atomic
+counters with no hot-path logging. Hits count reused segments, not whole I/O
+requests; a cross-range request can have both a hit and a miss. Reused bytes count
+bytes actually copied to the requester. A miss can end in an I/O/hash failure.
+Performance is unverified until measured on hardware; this cache is default-off.
+Host validation: `sh drivers/NativeMsdc/tests/run-cache.sh`.
+
+Fresh unverified/Data windows do not allocate a verification lock, and cache-off
+or Data writes do not take the cache invalidation lock. The read entry captures
+a configuration epoch before validation and rechecks epoch/window size under the
+window lock; reconfigured/offline reads fail before I/O or copying. A failed live
+reconfiguration leaves the verified window offline rather than falling back to
+unauthenticated reads. A04BR3 optionally reports nonzero aggregate counters on
+its existing process-report thread, no more often than once per 60 seconds.

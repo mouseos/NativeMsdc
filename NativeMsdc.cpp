@@ -79,6 +79,9 @@ volatile uint32_t native_msdc_manifest_status = 0xffffffff;
 volatile uint32_t native_msdc_dma = 0;                      // 0 PIO, 1 DMA verified, 2 DMA rejected, 3 quarantined
 volatile uint32_t native_msdc_blocks_published = 0;
 volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flushes = 0, native_msdc_failures = 0;
+// Optional verified-root snapshot reuse: hits, misses, authenticated bytes reused.
+volatile uint64_t native_msdc_verified_cache_stats[3] = {};
+
 // Signed root policy (NATIVE_VERIFIED_BLOCK): header status (PolicyStatus, 0xffffffff not read), windows that passed
 // vr_open, verified 4096-byte blocks served and integrity failures.
 volatile uint32_t native_msdc_policy_status = 0xffffffff;
@@ -770,6 +773,16 @@ const char *vrReason (int status)
 } // namespace
 #endif // NATIVE_MSDC_VERIFIED
 
+#if NATIVE_MSDC_VERIFIED
+// Reconfiguration shares the existing per-window read lock, including failures.
+class VerifiedWindowGuard {
+  IOLock *mutex;
+public:
+  explicit VerifiedWindowGuard (IOLock *lock) : mutex (lock) { if (mutex) IOLockLock (mutex); }
+  ~VerifiedWindowGuard () { if (mutex) IOLockUnlock (mutex); }
+};
+#endif
+
 class NativeMsdcBlock : public IOBlockStorageDevice {
   OSDeclareDefaultStructors (NativeMsdcBlock)
   uint64_t firstSector = 0;   // absolute, 512-byte sectors
@@ -780,11 +793,16 @@ class NativeMsdcBlock : public IOBlockStorageDevice {
   bool online = false;
 #if NATIVE_MSDC_VERIFIED
   bool verifiedActive = false;
+  bool verifiedCacheEnabled = false;
+  bool manifestReadOnly = false;
+  uint64_t verifiedConfiguration = 0;
+  VerifiedReadCache verifiedCache;
   struct vr_view verified = {};
   const uint8_t *envelope = nullptr;    // the selected VROOT01 envelope in the read-only policy copy
   uint8_t *verifiedBounce = nullptr;    // kTransferBytes, under verifiedLock from read through copy
   IOLock *verifiedLock = nullptr;
-  IOReturn readVerified (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion *completion);
+  IOReturn readVerified (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count, IOStorageCompletion *completion,
+                         uint64_t configuration);
 #endif
 public:
   bool configure (unsigned index, const RootWindow &entry, uint64_t absoluteSector, bool allowWrites);
@@ -824,6 +842,14 @@ OSDefineMetaClassAndStructors (NativeMsdcBlock, IOBlockStorageDevice)
 
 bool NativeMsdcBlock::configure (unsigned index, const RootWindow &entry, uint64_t absoluteSector, bool allowWrites)
 {
+#if NATIVE_MSDC_VERIFIED
+  // Invalidate before even a rejected reconfiguration; preserve lock ordering.
+  VerifiedWindowGuard guard (verifiedLock);
+  verifiedCache.invalidate ();
+  __atomic_add_fetch (&verifiedConfiguration, 1, __ATOMIC_RELEASE);
+  if (verifiedActive) online = false; // a failed live reconfiguration must fail closed
+  verifiedActive = false;
+#endif
   uint64_t count = entry.size / kSector;
   if (!count || absoluteSector < gHost.gpt.userdataFirst || absoluteSector > gHost.gpt.userdataLast ||
       count > gHost.gpt.userdataLast - absoluteSector + 1)
@@ -832,6 +858,9 @@ bool NativeMsdcBlock::configure (unsigned index, const RootWindow &entry, uint64
   firstSector = absoluteSector;
   sectors = count;
   writable = allowWrites && !(entry.flags & kWindowReadOnly);
+#if NATIVE_MSDC_VERIFIED
+  manifestReadOnly = (entry.flags & kWindowReadOnly) != 0;
+#endif
   strlcpy (label, entry.name, sizeof (label));
   return true;
 }
@@ -856,6 +885,17 @@ IOReturn NativeMsdcBlock::doSynchronizeCache ()
 IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                             IOStorageAttributes *attributes, IOStorageCompletion *completion)
 {
+#if NATIVE_MSDC_VERIFIED
+  const uint64_t configuration = verifiedActive ?
+    __atomic_load_n (&verifiedConfiguration, __ATOMIC_ACQUIRE) : 0;
+  // Cache-off and Data windows retain their original write hot path.
+  if (verifiedCacheEnabled && manifestReadOnly && buffer &&
+      buffer->getDirection () == kIODirectionOut && verifiedLock) {
+    IOLockLock (verifiedLock);
+    verifiedCache.invalidate ();
+    IOLockUnlock (verifiedLock);
+  }
+#endif
   if (!buffer || !completion || !completion->action || !count || block >= sectors || count > sectors - block ||
       buffer->getLength () < count * kSector)
     return kIOReturnBadArgument;
@@ -866,7 +906,7 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
   if (verifiedActive) {
     if (write) return kIOReturnNotWritable;     // a verified window is served read-only
     if (!online) return kIOReturnNotReady;
-    return readVerified (buffer, block, count, completion);
+    return readVerified (buffer, block, count, completion, configuration);
   }
 #endif
   if (write && !writable) return kIOReturnNotWritable;
@@ -901,6 +941,13 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
 const char *NativeMsdcBlock::configureVerification (int *status)
 {
   *status = -1;
+  if (!verifiedLock) verifiedLock = IOLockAlloc ();
+  if (!verifiedLock) return "verified read lock";
+  VerifiedWindowGuard guard (verifiedLock);
+  verifiedCache.invalidate ();
+  __atomic_add_fetch (&verifiedConfiguration, 1, __ATOMIC_RELEASE);
+  if (verifiedActive) online = false; // a failed live reconfiguration must fail closed
+  verifiedActive = false;
   if (!gPolicy.storage || !gPolicy.key) return "no signed root policy";
   const uint8_t *region = reinterpret_cast<const uint8_t *> (gPolicy.storage);
   uint64_t windowBytes = sectors * kSector;
@@ -915,30 +962,52 @@ const char *NativeMsdcBlock::configureVerification (int *status)
   *status = vr_open (region + entry.offset, static_cast<size_t> (entry.bytes), gPolicy.key, 1, &vr_xnu_crypto, &view);
   if (*status != VR_OK) return vrReason (*status);
   if (view.image_bytes != windowBytes) return "signed image size differs from the window";
-  verifiedBounce = static_cast<uint8_t *> (IOMalloc (kTransferBytes));
-  verifiedLock = IOLockAlloc ();
+  if (!verifiedBounce) verifiedBounce = static_cast<uint8_t *> (IOMalloc (kTransferBytes));
+  if (!verifiedLock) verifiedLock = IOLockAlloc ();
   if (!verifiedBounce || !verifiedLock) return "verified read buffers";
   verified = view;
   envelope = region + entry.offset;
   writable = false;
+  verifiedCacheEnabled = bootArgument ("native-msdc-vcache", 1, 0) == 1;
+  verifiedCache.metrics = native_msdc_verified_cache_stats;
   verifiedActive = true;
   return nullptr;
 }
 
 IOReturn NativeMsdcBlock::readVerified (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
-                                        IOStorageCompletion *completion)
+                                        IOStorageCompletion *completion, uint64_t configuration)
 {
+  VerifiedReadKey cacheKey = {};
+  const uint64_t windowBytes = sectors * kSector;
   struct Operations {
     IOLock *mutex;
     IOMemoryDescriptor *buffer;
     const vr_view *view;
     uint64_t firstSector;
-    void lock () { IOLockLock (mutex); }
+    NativeMsdcBlock *owner;
+    VerifiedReadKey *key;
+    uint64_t expectedConfiguration, expectedWindowBytes;
+    void lock () {
+      IOLockLock (mutex);
+      // Bounds were checked before taking this lock: reject a changed window,
+      // even with cache disabled, before any read or requester copy.
+      if (owner->verifiedConfiguration != expectedConfiguration ||
+          owner->sectors * kSector != expectedWindowBytes || !owner->verifiedActive || !owner->online) {
+        *key = {};
+        return;
+      }
+      firstSector = owner->firstSector;
+      *key = { owner->window, owner->firstSector, owner->sectors * kSector,
+               owner->verifiedConfiguration, owner->verified.generation,
+               owner->verifiedCacheEnabled && owner->verifiedActive &&
+               owner->manifestReadOnly && !owner->writable };
+    }
     void unlock () { IOLockUnlock (mutex); }
     int badArgument () { return kIOReturnBadArgument; }
     int ioError () { return kIOReturnIOError; }
     int read (uint64_t windowSector, uint32_t blocks, uint8_t *out)
     {
+      if (!owner->verifiedActive || !owner->online) return kIOReturnNotReady;
       HostSession session;
       return transfer (firstSector + windowSector, blocks, out, false);
     }
@@ -956,9 +1025,9 @@ IOReturn NativeMsdcBlock::readVerified (IOMemoryDescriptor *buffer, UInt64 block
     {
       return buffer->writeBytes (offset, data, length);
     }
-  } operations = { verifiedLock, buffer, &verified, firstSector };
-  VerifiedReadResult outcome = verifiedReadWindow (operations, sectors * kSector, block, count, verifiedBounce,
-                                                   kTransferBytes);
+  } operations = { verifiedLock, buffer, &verified, firstSector, this, &cacheKey, configuration, windowBytes };
+  VerifiedReadResult outcome = verifiedReadWindow (operations, windowBytes, block, count, verifiedBounce,
+                                                   kTransferBytes, &verifiedCache, &cacheKey);
   if (outcome.status == kIOReturnNotPrivileged)
     IOLog ("NativeMsdc: %s: read of sectors %llu+%llu refused, a block failed its signed hash\n", label, block, count);
   completion->action (completion->target, completion->parameter, outcome.status, outcome.done);

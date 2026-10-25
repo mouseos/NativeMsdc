@@ -450,11 +450,35 @@ static inline unsigned selectPolicy (const uint8_t *region, const PolicyHeader &
 //   uint64_t copy (uint64_t requestOffset, const uint8_t *data, uint64_t length)  bytes copied
 //   int badArgument (), int ioError ()
 // done counts the bytes delivered to the caller before the first failure.
+// One authenticated snapshot in the existing 64 KiB bounce buffer. Callers hold
+// their window lock for invalidation, lookup and fill. No Data/overlay caller.
+struct VerifiedReadKey {
+  uint64_t window, firstSector, windowBytes, configuration, generation;
+  bool eligible;
+};
+struct VerifiedReadCache {
+  bool valid = false;
+  VerifiedReadKey key = {};
+  const uint8_t *storage = nullptr;
+  uint64_t base = 0, length = 0;
+  volatile uint64_t *metrics = nullptr; // aggregate hits, misses, reused bytes
+  void invalidate () { valid = false; storage = nullptr; length = 0; }
+  void count (unsigned index, uint64_t value) {
+    if (metrics) __atomic_fetch_add (&metrics[index], value, __ATOMIC_RELAXED);
+  }
+  bool matches (const VerifiedReadKey &other) const {
+    return valid && other.eligible && key.window == other.window && key.firstSector == other.firstSector &&
+      key.windowBytes == other.windowBytes && key.configuration == other.configuration && key.generation == other.generation;
+  }
+};
+
 struct VerifiedReadResult { int status; uint64_t done; };
 
 template <class Ops>
 static inline VerifiedReadResult verifiedReadWindow (Ops &ops, uint64_t windowBytes, uint64_t block, uint64_t count,
-                                                     uint8_t *bounce, uint64_t bounceBytes)
+                                                     uint8_t *bounce, uint64_t bounceBytes,
+                                                     VerifiedReadCache *cache = nullptr,
+                                                     const VerifiedReadKey *key = nullptr)
 {
   if (!bounce || bounceBytes < kVerifiedBlock || (bounceBytes % kVerifiedBlock) || !windowBytes ||
       (windowBytes % kSector) || !count || block >= windowBytes / kSector || count > windowBytes / kSector - block)
@@ -462,10 +486,41 @@ static inline VerifiedReadResult verifiedReadWindow (Ops &ops, uint64_t windowBy
   VerifiedReadResult result = { 0, 0 };
   uint64_t start = block * kSector, remaining = count * kSector;
   ops.lock ();
+  // Optional key is populated/validated by the caller under this same lock.
+  // Zero/mismatched window size also rejects concurrent reconfiguration when
+  // caching is disabled: no I/O and no external copy may follow stale bounds.
+  if (key && key->windowBytes != windowBytes) {
+    if (cache) cache->invalidate ();
+    ops.unlock ();
+    return { ops.ioError (), 0 };
+  }
+  const bool caching = cache && key && key->eligible && key->windowBytes == windowBytes && bounceBytes == 65536;
+  if (cache && (!caching || !cache->matches (*key) || cache->storage != bounce)) cache->invalidate ();
   while (remaining) {
     uint64_t position = start + result.done;
+    if (caching && cache->matches (*key) && position >= cache->base && position - cache->base < cache->length) {
+      uint64_t offset = position - cache->base;
+      uint64_t usable = cache->length - offset;
+      if (usable > remaining) usable = remaining;
+      cache->count (0, 1);
+      uint64_t copied = ops.copy (result.done, bounce + offset, usable);
+      if (copied != usable) {
+        if (copied < usable) { result.done += copied; cache->count (2, copied); }
+        cache->invalidate ();
+        result.status = ops.ioError ();
+        break;
+      }
+      cache->count (2, usable);
+      result.done += usable;
+      remaining -= usable;
+      continue;
+    }
+    if (cache) cache->invalidate (); // read may overwrite or fail: never retain an older entry
+    if (caching) cache->count (1, 1);
     uint64_t first = position / kVerifiedBlock, skip = position % kVerifiedBlock;
-    uint64_t blocks = (skip + remaining + kVerifiedBlock - 1) / kVerifiedBlock;
+    // Quotient/remainder form avoids overflow for a near-UINT64_MAX window.
+    uint64_t blocks = remaining / kVerifiedBlock +
+      (remaining % kVerifiedBlock + skip + kVerifiedBlock - 1) / kVerifiedBlock;
     if (blocks > bounceBytes / kVerifiedBlock) blocks = bounceBytes / kVerifiedBlock;
     uint64_t base = first * kVerifiedBlock;
     uint64_t chunk = blocks * kVerifiedBlock;
@@ -483,11 +538,20 @@ static inline VerifiedReadResult verifiedReadWindow (Ops &ops, uint64_t windowBy
       if (result.status) break;
     }
     if (result.status) break;
+    // All bytes in this exact chunk passed authentication, including short tails.
+    if (caching) {
+      cache->key = *key;
+      cache->storage = bounce;
+      cache->base = base;
+      cache->length = chunk;
+      cache->valid = true;
+    }
     uint64_t usable = chunk - skip;
     if (usable > remaining) usable = remaining;
     uint64_t copied = ops.copy (result.done, bounce + skip, usable);
     if (copied != usable) {
       if (copied < usable) result.done += copied;
+      if (cache) cache->invalidate ();
       result.status = ops.ioError ();
       break;
     }
