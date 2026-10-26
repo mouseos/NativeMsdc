@@ -215,6 +215,27 @@ static inline const char *gptFindUserdata (const uint8_t *entries, GptLayout &gp
   return found ? nullptr : "no userdata partition";
 }
 
+// A named, read-only firmware/calibration partition. The complete GPT is
+// validated by gptFindUserdata before any output is committed.
+static inline bool gptFindPartition(const uint8_t *entries, GptLayout layout,
+    const char *name, uint64_t &first, uint64_t &bytes)
+{
+  if (!name || !name[0]) return false;
+  unsigned n = 0; while (n < 37 && name[n]) ++n;
+  if (n > 36 || gptFindUserdata(entries, layout)) return false;
+  bool found = false; uint64_t start = 0, length = 0;
+  for (unsigned i = 0; i < layout.entryCount; ++i) {
+    const uint8_t *entry = entries + i * kGptEntryBytes;
+    if (!gptEntryUsed(entry) || !gptEntryNamed(entry, name)) continue;
+    if (found) return false;
+    start = le64(entry + 32); length = le64(entry + 40) - start + 1;
+    if (length > UINT64_MAX / kSector) return false;
+    found = true;
+  }
+  if (!found) return false;
+  first = start; bytes = length * kSector; return true;
+}
+
 // ---- SHNGROOT manifest at the start of userdata (UniXNU docs: concepts/userdata) ----------------------------------
 constexpr unsigned kManifestBytes = 4096;
 constexpr unsigned kManifestHashed = 4064;    // the manifest SHA-256 at 4064 covers bytes 0..4063

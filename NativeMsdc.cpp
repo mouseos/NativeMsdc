@@ -39,6 +39,9 @@
 #else
 #define NATIVE_MSDC_VERIFIED 0
 #endif
+#ifndef NATIVE_MSDC_PARTITION_READ
+#define NATIVE_MSDC_PARTITION_READ 0
+#endif
 #include <IOKit/IOService.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOLib.h>
@@ -127,6 +130,11 @@ struct MsdcHost {
   bool manifestValid;
 };
 MsdcHost gHost;
+#if NATIVE_MSDC_PARTITION_READ
+// Immutable after hostFindLayout validates the entire primary GPT. Transfers
+// still serialize with root/store I/O via the SAME HostSession and bounce.
+uint8_t gPartitionEntries[kGptMaxEntries * kGptEntryBytes];
+#endif
 bool gModeTelemetryEnabled; // exact native-msdc-mode=1, sampled once before bring-up
 
 inline uint32_t rd (unsigned offset)
@@ -684,6 +692,9 @@ bool hostFindLayout (const char **why)
     *why = reason;
     return false;
   }
+#if NATIVE_MSDC_PARTITION_READ
+  memcpy(gPartitionEntries, gHost.bounce, gpt.entryCount * kGptEntryBytes);
+#endif
   gHost.gpt = gpt;
   gHost.layoutValid = true;
   native_msdc_step = 3;
@@ -1445,6 +1456,34 @@ extern "C" int native_msdc_store_open (uint64_t blocks, uint64_t *firstSector, c
   else IOLog ("NativeMsdc: store refused: %s\n", reason);
   return ok;
 }
+
+#if NATIVE_MSDC_PARTITION_READ
+// Kernel-owned buffer only; no raw disk/write API and no second controller.
+extern "C" uint64_t native_msdc_part_size(const char *name)
+{
+  if (!gHost.ready || !gHost.layoutValid || gHost.poisoned) return 0;
+  HostSession session;
+  uint64_t first = 0, bytes = 0;
+  return gptFindPartition(gPartitionEntries, gHost.gpt, name, first, bytes) ? bytes : 0;
+}
+extern "C" int native_msdc_part_read(const char *name, uint64_t offset, void *buffer, uint32_t bytes)
+{
+  if (!buffer || !bytes || !gHost.ready || !gHost.layoutValid || gHost.poisoned) return 0;
+  HostSession session;
+  uint64_t first = 0, total = 0;
+  if (!gptFindPartition(gPartitionEntries, gHost.gpt, name, first, total) ||
+      offset > total || bytes > total - offset) return 0;
+  auto *out = static_cast<uint8_t *>(buffer);
+  while (bytes) {
+    unsigned inside = unsigned(offset % kSector);
+    unsigned count = kSector - inside; if (count > bytes) count = bytes;
+    if (transfer(first + offset / kSector, 1, gHost.bounce, false) != kIOReturnSuccess) return 0;
+    memcpy(out, gHost.bounce + inside, count);
+    out += count; offset += count; bytes -= count;
+  }
+  return 1;
+}
+#endif
 
 extern "C" int native_msdc_store_read (uint64_t relative, uint32_t blocks, void *destination)
 {
