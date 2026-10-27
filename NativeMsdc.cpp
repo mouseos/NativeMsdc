@@ -448,14 +448,28 @@ unsigned bootArgument (const char *name, unsigned maximum, unsigned fallback)
   return value;
 }
 
-// Exact long spelling has precedence, including explicit 0 or invalid values.
-// The short default-off alias fits boards with a nearly full boot command line.
+// Scan whole ASCII tokens: numeric boot-arg conversion truncates wide values
+// and treats a bare name as true. Neither constitutes the exact opt-in '=1'.
+static int verifiedCacheToken (const char *args, const char *name)
+{
+  const size_t size = strlen (name);
+  if (!args) return -1;
+  while (*args) {
+    while (*args == ' ' || *args == '\t' || *args == '\n' || *args == '\r') ++args;
+    const char *end = args;
+    while (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') ++end;
+    const size_t length = size_t (end - args);
+    if (length >= size && !strncmp (args, name, size) && (length == size || args[size] == '='))
+      return length == size + 2 && args[size] == '=' && args[size + 1] == '1' ? 1 : 0;
+    args = end;
+  }
+  return -1;
+}
 bool verifiedCacheArgument ()
 {
-  unsigned value = 0;
-  if (PE_parse_boot_argn ("native-msdc-vcache", &value, sizeof (value))) return value == 1;
-  value = 0;
-  return PE_parse_boot_argn ("mcv", &value, sizeof (value)) && value == 1;
+  const char *args = PE_boot_args ();
+  const int full = verifiedCacheToken (args, "native-msdc-vcache");
+  return (full >= 0 ? full : verifiedCacheToken (args, "mcv")) == 1;
 }
 
 
