@@ -154,7 +154,7 @@ counters with no hot-path logging. Hits count reused segments, not whole I/O
 requests; a cross-range request can have both a hit and a miss. Reused bytes count
 bytes actually copied to the requester. A miss can end in an I/O/hash failure.
 Performance is unverified until measured on hardware; this cache is default-off.
-Host validation: `sh drivers/NativeMsdc/tests/run-cache.sh`.
+Host validation: `sh drivers/NativeMsdc/tests/run-cache.sh`. The host fixture also exercises concurrent reads and cache invalidation against a mutex-backed model; it does not validate IOKit, DMA, device lifetime, or concurrent physical media mutation.
 
 Fresh unverified/Data windows do not allocate a verification lock, and cache-off
 or Data writes do not take the cache invalidation lock. The read entry captures
