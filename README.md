@@ -235,9 +235,17 @@ writers must use the common ArmCpu controller synchronization.
 The driver attaches permanently for its host lifetime and only accepts an
 inherited zero interrupt-enable register. Initial DMA-vs-PIO testing remains
 polled. The interrupt handler only handles the currently armed DMA events. Eight
-consecutive spurious interrupts mask only the owned GIC SPI and disable IRQ waits.
-A wait checks interrupt and preemption state before blocking; other contexts
-continue polling. If no IRQ arrives in 10 ms, the driver disables this wait
+consecutive spurious interrupts request masking only the owned GIC SPI and
+disable IRQ waits. ISENABLER is read back. A failed mask is counted, the
+controller interrupt-enable register is cleared, and a persistent or
+unquenchable interrupt storm panics rather than looping indefinitely.
+Only explicitly marked policy and manifest reads in the driver's own
+`kernel_thread_start` publication thread may wait; its thread identity, IRQ
+state and preemption level are checked. Initial reads, normal block I/O
+(including launchd reads), verified block callbacks, and store ABI callers
+continue polling because their complete caller/lock contracts are unproven.
+The publisher holds the host mutex across sleep; the primary IRQ handler takes
+only a separate spin lock and never waits on that mutex. If no IRQ arrives in 10 ms, the driver disables this wait
 mode and continues the in-flight DMA through the original polling path and
 original one-second deadline. The DMA self-test can still reject DMA and use
 PIO. A transfer error does not trigger an unsafe blind PIO retry.

@@ -92,6 +92,7 @@ volatile uint32_t native_msdc_blocks_published = 0;
 #if NATIVE_MSDC_IRQ_WAIT
 // IRQs captured, wait attempts, delivery fallback, elapsed wait nanoseconds.
 volatile uint64_t native_msdc_irq_stats[4] = {};
+volatile uint64_t native_msdc_irq_mask_failures = 0;
 #endif
 volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flushes = 0, native_msdc_failures = 0;
 // Optional verified-root snapshot reuse: hits, misses, authenticated bytes reused.
@@ -149,6 +150,11 @@ struct MsdcHost {
   bool manifestValid;
 };
 MsdcHost gHost;
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+// Only explicit publication-thread reads opt in; storage callbacks and store
+// ABI callers retain polling until their complete lock/caller contracts are proven.
+thread_t gPublisherThread = nullptr;
+#endif
 bool gModeTelemetryEnabled; // exact native-msdc-mode=1, sampled once before bring-up
 
 inline uint32_t rd (unsigned offset)
@@ -183,11 +189,18 @@ void dmaIrq (void *)
   } else if (++gHost.irqSpurious >= 8) {
     // An asserted line with no enabled DMA event must not storm. Mask only
     // our registered GIC SPI, and force an active waiter back to polling.
-    if (armcpu_spi_mask_owned (gHost.irqSpi + 32, dmaIrq, nullptr)) {
-      __atomic_store_n (&gHost.irqFault, 1, __ATOMIC_RELEASE);
-      wr (kMsdcIntEn, 0);
-      wake = true;
+    bool masked = armcpu_spi_mask_owned (gHost.irqSpi + 32, dmaIrq, nullptr);
+    __atomic_store_n (&gHost.irqFault, 1, __ATOMIC_RELEASE);
+    wr (kMsdcIntEn, 0);
+    wake = true;
+    if (!masked) {
+      __atomic_fetch_add (&native_msdc_irq_mask_failures, 1, __ATOMIC_RELAXED);
+      // If neither layer can be silenced, stop rather than loop in IRQ forever.
+      if (rd (kMsdcIntEn) || gHost.irqSpurious >= 16)
+        panic ("NativeMsdc: unmaskable interrupt storm");
     }
+    if (gHost.irqSpurious >= 32)
+      panic ("NativeMsdc: interrupt continues after mask");
   }
   IOSimpleLockUnlockEnableInterrupt (gHost.irqLock, state);
   if (wake) thread_wakeup (reinterpret_cast<event_t> (&gHost.irqStatus));
@@ -372,8 +385,11 @@ IOReturn hostReadPio (unsigned opcode, uint32_t argument, uint8_t *buffer, uint3
 
 // Descriptor DMA read into the private bounce buffer, then a copy out. The buffer is never reused while the engine
 // may still write to it: if the engine does not stop, the transport is quarantined and the memory kept.
-IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks)
+IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks, bool publisherRead = false)
 {
+#if !(NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES)
+  (void) publisherRead;
+#endif
   if (!gHost.dmaVirt || !blocks || blocks > kMaxBlocks) return kIOReturnBadArgument;
   unsigned bytes = blocks * kSector;
   DmaGpd *gpd = reinterpret_cast<DmaGpd *> (gHost.dmaVirt);
@@ -405,7 +421,13 @@ IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks)
     wr (kDmaCtrl, rd (kDmaCtrl) | kDmaCtrlStart);
     uint64_t end = deadlineAfter (kCommandTimeoutNs);
 #if NATIVE_MSDC_IRQ_WAIT
-    if (gHost.irqReady && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE) &&
+#if NATIVE_MSDC_BLOCK_DEVICES
+    const bool publisherContext = publisherRead &&
+      __atomic_load_n (&gPublisherThread, __ATOMIC_ACQUIRE) == current_thread ();
+#else
+    const bool publisherContext = false;
+#endif
+    if (publisherContext && gHost.irqReady && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE) &&
         ml_get_interrupts_enabled () && get_preemption_level () == 0) {
       result = waitDmaIrq (end);
     } else result = kIOReturnNotReady;
@@ -540,14 +562,14 @@ public:
 };
 
 // One transfer of at most kMaxBlocks sectors anywhere on the user area; callers bound it to their own region.
-IOReturn transfer (uint64_t sector, uint32_t blocks, uint8_t *buffer, bool write)
+IOReturn transfer (uint64_t sector, uint32_t blocks, uint8_t *buffer, bool write, bool publisherRead = false)
 {
   if (gHost.poisoned) return kIOReturnNotReady;
   if (!blocks || blocks > kMaxBlocks || sector >= gHost.diskSectors || blocks > gHost.diskSectors - sector)
     return kIOReturnBadArgument;
   IOReturn result;
   if (write) result = hostWrite (uint32_t (sector), buffer, blocks);
-  else if (gHost.dmaEnabled) result = hostReadDma (uint32_t (sector), buffer, blocks);
+  else if (gHost.dmaEnabled) result = hostReadDma (uint32_t (sector), buffer, blocks, publisherRead);
   else result = hostReadPio (kCmdReadSingle, uint32_t (sector), buffer, blocks);
   if (result != kIOReturnSuccess) __atomic_fetch_add (&native_msdc_failures, 1, __ATOMIC_RELAXED);
   else __atomic_fetch_add (write ? &native_msdc_writes : &native_msdc_reads, 1, __ATOMIC_RELAXED);
@@ -716,8 +738,9 @@ void hostEnableIrq (IOService *provider)
     OSSafeReleaseNULL (gHost.sysirqMap);
     return;
   }
-  // A failed enable/readback may still have published a handler. Its GIC
-  // source is masked by ArmCpu; keep the lock and mapping alive forever.
+  // A failed enable/readback may still have published a handler. ArmCpu
+  // attempts to mask the source; keep the handler state alive even if the
+  // readback says that masking failed.
   gHost.irqReady = status == kIOReturnSuccess && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE);
   IOLog ("NativeMsdc: IRQ wait %s spi=%u gic=0x%x target=0x%llx\n",
          gHost.irqReady ? "ready" : "unavailable", spi, readback, target);
@@ -924,7 +947,7 @@ const char *loadPolicy (void)
   uint8_t digest[32];
   {
     HostSession session;
-    if (transfer (firstSector, kPolicyHeaderBytes / kSector, gHost.bounce, false) != kIOReturnSuccess)
+    if (transfer (firstSector, kPolicyHeaderBytes / kSector, gHost.bounce, false, true) != kIOReturnSuccess)
       return "policy header read failed";
     policyDigest (gHost.bounce, digest);
     status = parsePolicyHeader (gHost.bounce, digest, available, header);
@@ -946,7 +969,7 @@ const char *loadPolicy (void)
   for (uint64_t done = 0; done < sectors;) {
     uint32_t blocks = sectors - done > kMaxBlocks ? kMaxBlocks : uint32_t (sectors - done);
     HostSession session;
-    if (transfer (firstSector + done, blocks, region + done * kSector, false) != kIOReturnSuccess) {
+    if (transfer (firstSector + done, blocks, region + done * kSector, false, true) != kIOReturnSuccess) {
       freePolicy ();
       return "policy region read failed";
     }
@@ -1336,7 +1359,7 @@ bool windowMatchesManifest (NativeMsdcBlock *device)
   for (uint64_t done = 0; done < count;) {
     uint32_t blocks = count - done > kMaxBlocks ? kMaxBlocks : uint32_t (count - done);
     HostSession session;
-    if (transfer (first + done, blocks, gHost.bounce, false) != kIOReturnSuccess) return false;
+    if (transfer (first + done, blocks, gHost.bounce, false, true) != kIOReturnSuccess) return false;
     SHA256_Update (&context, gHost.bounce, size_t (blocks) * kSector);
     done += blocks;
   }
@@ -1385,6 +1408,9 @@ void discardPending (unsigned index)
 // resolvable when the root mounts. A window that fails its hash or its start is not published; the rest continue.
 void publishThread (void *, wait_result_t)
 {
+#if NATIVE_MSDC_IRQ_WAIT
+  __atomic_store_n (&gPublisherThread, current_thread (), __ATOMIC_RELEASE);
+#endif
 #if NATIVE_MSDC_VERIFIED
   // Every window needs its signed policy before it is published; the region is read here, off the matching thread,
   // since it is tens of MiB. A window without an accepted policy is discarded and never published.
@@ -1437,6 +1463,9 @@ void publishThread (void *, wait_result_t)
     device->release ();
   }
   native_msdc_step = 6;
+#if NATIVE_MSDC_IRQ_WAIT
+  __atomic_store_n (&gPublisherThread, static_cast<thread_t> (nullptr), __ATOMIC_RELEASE);
+#endif
   gPendingProvider->release ();
 }
 

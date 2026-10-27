@@ -14,7 +14,7 @@ struct Host { bool poisoned=false,dmaEnabled=false; uint32_t diskSectors=1000; }
 uint64_t native_msdc_failures=0,native_msdc_writes=0,native_msdc_reads=0;
 int pio=0,dma=0,writes=0; int next=0;
 int hostReadPio(unsigned,uint32_t,uint8_t*,uint32_t){++pio;return next;}
-int hostReadDma(uint32_t,uint8_t*,uint32_t){++dma;return next;}
+int hostReadDma(uint32_t,uint8_t*,uint32_t,bool){++dma;return next;}
 int hostWrite(uint32_t,uint8_t*,uint32_t){++writes;return next;}
 '''
 post=r'''

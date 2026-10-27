@@ -30,24 +30,25 @@ using IOReturn=int; using IOInterruptState=int; using wait_result_t=int; using e
 constexpr int THREAD_UNINT=0, THREAD_WAITING=1; constexpr void *THREAD_CONTINUE_NULL=nullptr;
 std::mutex spin, sleepMutex; std::condition_variable cv; unsigned epoch=0;
 thread_local unsigned myEpoch; thread_local uint64_t myDeadline;
-uint64_t native_msdc_irq_stats[4]{};
+uint64_t native_msdc_irq_stats[4]{}, native_msdc_irq_mask_failures=0;
+bool maskWorks=true,stuckEnabled=false;int panicCount=0;void panic(const char*){++panicCount;}
 void absolutetime_to_nanoseconds(uint64_t in,uint64_t *out){*out=in;}
 std::atomic<bool> asserted{false};
 std::atomic<uint32_t> status{0}, enabled{0};
 struct Host { std::mutex *irqLock; bool irqArmed=false, irqReady=true, irqDelivered=false; uint32_t irqStatus=0,irqSpi=78,irqSpurious=0; volatile uint32_t irqFault=0; } gHost{&spin};
-bool armcpu_spi_mask_owned(uint32_t id,void(*)(void*),void*){assert(id==110);return true;}
+bool armcpu_spi_mask_owned(uint32_t id,void(*)(void*),void*){assert(id==110);return maskWorks;}
 uint64_t mach_absolute_time(){return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();}
 uint64_t deadlineAfter(uint64_t ns){return mach_absolute_time()+ns;}
 int IOSimpleLockLockDisableInterrupt(std::mutex *m){m->lock();return 1;}
 void IOSimpleLockUnlockEnableInterrupt(std::mutex *m,int){m->unlock();}
 uint32_t rd(unsigned n){return n==kMsdcIntr?status.load():enabled.load();}
-void wr(unsigned n,uint32_t v){if(n==kMsdcIntr)status.fetch_and(~v);else enabled.store(v);}
+void wr(unsigned n,uint32_t v){if(n==kMsdcIntr)status.fetch_and(~v);else if(!stuckEnabled) enabled.store(v);}
 int assert_wait_deadline(event_t,int,uint64_t d){std::lock_guard<std::mutex> l(sleepMutex);myEpoch=epoch;myDeadline=d;asserted=true;return THREAD_WAITING;}
 int thread_block(void*){std::unique_lock<std::mutex> l(sleepMutex);cv.wait_until(l,steady_clock::time_point(nanoseconds(myDeadline)),[]{return epoch!=myEpoch;});return 0;}
 void thread_wakeup(event_t){std::lock_guard<std::mutex> l(sleepMutex);++epoch;cv.notify_all();}
 '''
 suffix = r'''
-void reset(){status=0;enabled=0;asserted=false;gHost.irqArmed=false;gHost.irqReady=true;gHost.irqStatus=0;gHost.irqSpurious=0;gHost.irqFault=0;}
+void reset(){status=0;enabled=0;asserted=false;gHost.irqArmed=false;gHost.irqReady=true;gHost.irqStatus=0;gHost.irqSpurious=0;gHost.irqFault=0;maskWorks=true;stuckEnabled=false;panicCount=0;native_msdc_irq_mask_failures=0;}
 void inject(uint32_t bits){status.fetch_or(bits);dmaIrq(nullptr);}
 void waitAsserted(){auto end=steady_clock::now()+seconds(1);while(!asserted && steady_clock::now()<end)std::this_thread::yield();assert(asserted);}
 uint64_t cpuNs(){timespec ts{};clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&ts);return uint64_t(ts.tv_sec)*1000000000+ts.tv_nsec;}
@@ -56,6 +57,12 @@ int main(){
  reset();int result=-1;std::thread t([&]{result=waitDmaIrq(deadlineAfter(100000000));});waitAsserted();inject(kIntXferDone);t.join();assert(result==0 && status==0 && !gHost.irqArmed);
  // Repeated spurious entries mask the owned SPI and wake the waiter.
  reset();result=-1;std::thread storm([&]{result=waitDmaIrq(deadlineAfter(100000000));});waitAsserted();for(int i=0;i<8;i++)dmaIrq(nullptr);storm.join();assert(result==kIOReturnNotReady && gHost.irqFault==1 && enabled==0);
+ // GIC mask readback failure disables INTEN, records fault, wakes the waiter,
+ // and escalates if further interrupts prove the source is not quiescent.
+ reset();maskWorks=false;result=-1;std::thread badmask([&]{result=waitDmaIrq(deadlineAfter(100000000));});waitAsserted();for(int i=0;i<8;i++)dmaIrq(nullptr);badmask.join();assert(result==kIOReturnNotReady && gHost.irqFault==1 && native_msdc_irq_mask_failures==1 && enabled==0);
+ for(int i=0;i<8;i++){dmaIrq(nullptr);}assert(panicCount==1);
+ // A source that also refuses INTEN clear is immediately fatal.
+ reset();maskWorks=false;stuckEnabled=true;enabled=1;gHost.irqSpurious=7;dmaIrq(nullptr);assert(panicCount==1 && native_msdc_irq_mask_failures==1);stuckEnabled=false;
  // IRQ has latched and W1C-cleared status before the waiter resumes: no lost wake.
  reset();result=-1;std::thread u([&]{result=waitDmaIrq(deadlineAfter(100000000));});waitAsserted();inject(kIntXferDone | (1u<<14));u.join();assert(result==kIOReturnIOError && status==0);
  reset();result=-1;std::thread v([&]{result=waitDmaIrq(deadlineAfter(100000000));});waitAsserted();inject(1u<<18);v.join();assert(result==kIOReturnIOError);
