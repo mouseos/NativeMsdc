@@ -57,6 +57,17 @@
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+#ifndef NATIVE_MSDC_IRQ_WAIT
+#define NATIVE_MSDC_IRQ_WAIT 0
+#endif
+#if NATIVE_MSDC_IRQ_WAIT
+#include <kern/sched_prim.h>
+#include <machine/machine_routines.h>
+extern "C" int get_preemption_level (void);
+extern "C" IOReturn armcpu_spi_attach_sysirq (uint32_t, volatile uint32_t *, void (*) (void *), void *,
+                                               uint32_t *, uint64_t *, bool *);
+extern "C" bool armcpu_spi_mask_owned (uint32_t, void (*) (void *), void *);
+#endif
 #include <pexpert/pexpert.h>
 #if NATIVE_MSDC_VERIFIED
 #include <vm/vm_kern.h>
@@ -78,6 +89,10 @@ const char *volatile native_msdc_failure = nullptr;
 volatile uint32_t native_msdc_manifest_status = 0xffffffff;
 volatile uint32_t native_msdc_dma = 0;                      // 0 PIO, 1 DMA verified, 2 DMA rejected, 3 quarantined
 volatile uint32_t native_msdc_blocks_published = 0;
+#if NATIVE_MSDC_IRQ_WAIT
+// IRQs captured, wait attempts, delivery fallback, elapsed wait nanoseconds.
+volatile uint64_t native_msdc_irq_stats[4] = {};
+#endif
 volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flushes = 0, native_msdc_failures = 0;
 // Optional verified-root snapshot reuse: hits, misses, authenticated bytes reused.
 volatile uint64_t native_msdc_verified_cache_stats[3] = {};
@@ -121,6 +136,13 @@ struct MsdcHost {
   uint8_t *dmaVirt;
   uint64_t dmaPhys;
   bool dmaEnabled;
+#if NATIVE_MSDC_IRQ_WAIT
+  IOSimpleLock *irqLock;
+  IOMemoryMap *sysirqMap;
+  bool irqReady, irqArmed, irqDelivered;
+  uint32_t irqStatus, irqSpi, irqSpurious;
+  volatile uint32_t irqFault;
+#endif
   GptLayout gpt;
   bool layoutValid;
   RootManifest manifest;
@@ -139,6 +161,85 @@ inline void wr (unsigned offset, uint32_t value)
   *reinterpret_cast<volatile uint32_t *> (gHost.base + offset) = value;
   __asm__ volatile ("dsb sy" ::: "memory");
 }
+
+uint64_t deadlineAfter (uint64_t nanoseconds);
+
+#if NATIVE_MSDC_IRQ_WAIT
+// HostSession's mutex serializes requests; the primary IRQ handler uses only
+// this independent spin lock, never the mutex. Events are latched before W1C.
+constexpr uint32_t kDmaEvents = kIntXferDone | kIntDataErrors | kIntDmaErrors;
+void dmaIrq (void *)
+{
+  IOInterruptState state = IOSimpleLockLockDisableInterrupt (gHost.irqLock);
+  uint32_t events = gHost.irqArmed ? rd (kMsdcIntr) & rd (kMsdcIntEn) & kDmaEvents : 0;
+  bool wake = events != 0;
+  if (events) {
+    gHost.irqSpurious = 0;
+    gHost.irqStatus |= events;
+    gHost.irqDelivered = true;
+    __atomic_fetch_add (&native_msdc_irq_stats[0], 1, __ATOMIC_RELAXED);
+    wr (kMsdcIntEn, 0);
+    wr (kMsdcIntr, events);
+  } else if (++gHost.irqSpurious >= 8) {
+    // An asserted line with no enabled DMA event must not storm. Mask only
+    // our registered GIC SPI, and force an active waiter back to polling.
+    if (armcpu_spi_mask_owned (gHost.irqSpi + 32, dmaIrq, nullptr)) {
+      __atomic_store_n (&gHost.irqFault, 1, __ATOMIC_RELEASE);
+      wr (kMsdcIntEn, 0);
+      wake = true;
+    }
+  }
+  IOSimpleLockUnlockEnableInterrupt (gHost.irqLock, state);
+  if (wake) thread_wakeup (reinterpret_cast<event_t> (&gHost.irqStatus));
+}
+
+// INTEN remains zero during commands and after this function. Holding the
+// spin lock across the status check and assert_wait prevents a lost wakeup.
+IOReturn waitDmaIrq (uint64_t end)
+{
+  // Bound an undeliverable IRQ to 10 ms, then finish this transfer by polling.
+  __atomic_fetch_add (&native_msdc_irq_stats[1], 1, __ATOMIC_RELAXED);
+  uint64_t waitStart = mach_absolute_time ();
+  uint64_t probeEnd = deadlineAfter (10000000ULL);
+  if (probeEnd > end) probeEnd = end;
+  IOInterruptState state = IOSimpleLockLockDisableInterrupt (gHost.irqLock);
+  bool slept = false;
+  gHost.irqStatus = 0;
+  gHost.irqDelivered = false;
+  gHost.irqArmed = true;
+  wr (kMsdcIntEn, kDmaEvents);
+  for (;;) {
+    uint32_t events = rd (kMsdcIntr) & kDmaEvents;
+    if (events) { gHost.irqStatus |= events; wr (kMsdcIntr, events); }
+    uint32_t observed = gHost.irqStatus;
+    if (observed || __atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE) || mach_absolute_time () >= probeEnd) {
+      wr (kMsdcIntEn, 0);
+      // Capture an event arriving between the first status read and masking.
+      events = rd (kMsdcIntr) & kDmaEvents;
+      if (events) { observed |= events; wr (kMsdcIntr, events); }
+      gHost.irqArmed = false;
+      bool noDelivery = slept && mach_absolute_time () >= probeEnd && !gHost.irqDelivered;
+      if (noDelivery) {
+        gHost.irqReady = false;
+        __atomic_fetch_add (&native_msdc_irq_stats[2], 1, __ATOMIC_RELAXED);
+      }
+      IOSimpleLockUnlockEnableInterrupt (gHost.irqLock, state);
+      uint64_t elapsedNs = 0;
+      absolutetime_to_nanoseconds (mach_absolute_time () - waitStart, &elapsedNs);
+      __atomic_fetch_add (&native_msdc_irq_stats[3], elapsedNs, __ATOMIC_RELAXED);
+      if (observed & (kIntDataErrors | kIntDmaErrors)) return kIOReturnIOError;
+      if (observed & kIntXferDone) return kIOReturnSuccess;
+      // Delivery was not proven; do not pay this delay on subsequent reads.
+      gHost.irqReady = false;
+      return kIOReturnNotReady;
+    }
+    wait_result_t pending = assert_wait_deadline (reinterpret_cast<event_t> (&gHost.irqStatus), THREAD_UNINT, probeEnd);
+    IOSimpleLockUnlockEnableInterrupt (gHost.irqLock, state);
+    if (pending == THREAD_WAITING) { slept = true; (void) thread_block (THREAD_CONTINUE_NULL); }
+    state = IOSimpleLockLockDisableInterrupt (gHost.irqLock);
+  }
+}
+#endif
 
 #if NATIVE_MSDC_VERIFIED
 bool gRootTimingEnabled; // configured once before window publication
@@ -303,6 +404,14 @@ IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks)
                   kDmaCtrlDescriptor | kDmaCtrlBurst64);
     wr (kDmaCtrl, rd (kDmaCtrl) | kDmaCtrlStart);
     uint64_t end = deadlineAfter (kCommandTimeoutNs);
+#if NATIVE_MSDC_IRQ_WAIT
+    if (gHost.irqReady && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE) &&
+        ml_get_interrupts_enabled () && get_preemption_level () == 0) {
+      result = waitDmaIrq (end);
+    } else result = kIOReturnNotReady;
+    if (result == kIOReturnNotReady) {
+      result = kIOReturnSuccess;
+#endif
     for (;;) {
       uint32_t interrupts = rd (kMsdcIntr) & (kIntXferDone | kIntDataErrors | kIntDmaErrors);
       if (interrupts) {
@@ -318,6 +427,9 @@ IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks)
         break;
       }
     }
+#if NATIVE_MSDC_IRQ_WAIT
+    }
+#endif
   }
   wr (kDmaCtrl, rd (kDmaCtrl) | kDmaCtrlStop);
   if (waitClear (kDmaCfg, kDmaCfgActive) != kIOReturnSuccess) {
@@ -422,6 +534,7 @@ public:
     wr (kMsdcIntEn, interruptEnable);
     IOLockUnlock (gHost.lock);
   }
+  uint32_t inheritedInterrupts () const { return interruptEnable; }
   HostSession (const HostSession &) = delete;
   HostSession &operator= (const HostSession &) = delete;
 };
@@ -565,6 +678,51 @@ bool controllerWindow (IOService *provider, uint64_t &phys, uint64_t &length, co
   }
   return true;
 }
+
+#if NATIVE_MSDC_IRQ_WAIT
+// Board-specific wiring is passed as ADT metadata. Refuse unexpected shapes
+// or an inherited enabled source; startup and the DMA self-test remain polled.
+void hostEnableIrq (IOService *provider)
+{
+  OSData *spiData = OSDynamicCast (OSData, provider->getProperty ("msdc-irq-spi"));
+  OSData *baseData = OSDynamicCast (OSData, provider->getProperty ("msdc-sysirq-base"));
+  OSData *lowData = OSDynamicCast (OSData, provider->getProperty ("msdc-irq-low"));
+  if (!spiData || spiData->getLength () != 4 || !baseData || baseData->getLength () != 8 ||
+      !lowData || lowData->getLength () != 4 || !gHost.dmaEnabled) return;
+  uint32_t spi = 0, low = 0; uint64_t base = 0;
+  memcpy (&spi, spiData->getBytesNoCopy (), 4);
+  memcpy (&base, baseData->getBytesNoCopy (), 8);
+  memcpy (&low, lowData->getBytesNoCopy (), 4);
+  if (spi >= 256 || low != 1 || !base || (base & 3) || (base & 4095) + 32 > 4096) return;
+  HostSession session;
+  if (session.inheritedInterrupts ()) return;
+  gHost.irqLock = IOSimpleLockAlloc ();
+  IODeviceMemory *memory = IODeviceMemory::withRange (base & ~uint64_t (4095), 4096);
+  gHost.sysirqMap = memory ? memory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+  OSSafeReleaseNULL (memory);
+  if (!gHost.irqLock || !gHost.sysirqMap) {
+    if (gHost.irqLock) IOSimpleLockFree (gHost.irqLock);
+    gHost.irqLock = nullptr;
+    OSSafeReleaseNULL (gHost.sysirqMap);
+    return;
+  }
+  auto *polarity = reinterpret_cast<volatile uint32_t *> (gHost.sysirqMap->getVirtualAddress () +
+                                                           (base & 4095) + (spi / 32) * 4);
+  gHost.irqSpi = spi;
+  uint32_t readback = 0; uint64_t target = 0; bool installed = false;
+  IOReturn status = armcpu_spi_attach_sysirq (spi, polarity, dmaIrq, nullptr, &readback, &target, &installed);
+  if (status != kIOReturnSuccess && !installed) {
+    IOSimpleLockFree (gHost.irqLock); gHost.irqLock = nullptr;
+    OSSafeReleaseNULL (gHost.sysirqMap);
+    return;
+  }
+  // A failed enable/readback may still have published a handler. Its GIC
+  // source is masked by ArmCpu; keep the lock and mapping alive forever.
+  gHost.irqReady = status == kIOReturnSuccess && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE);
+  IOLog ("NativeMsdc: IRQ wait %s spi=%u gic=0x%x target=0x%llx\n",
+         gHost.irqReady ? "ready" : "unavailable", spi, readback, target);
+}
+#endif
 
 // Compare DMA with PIO on the same sectors; enable DMA only when they match.
 void hostEnableDma (void)
@@ -1315,6 +1473,9 @@ bool NativeMsdc::start (IOService *provider)
     IOService::stop (provider);
     return false;
   }
+#if NATIVE_MSDC_IRQ_WAIT
+  if (bootArgument ("native-msdc-irq", 1, 0) == 1) hostEnableIrq (provider);
+#endif
   if (!gHost.manifestValid) fail (manifestReason (native_msdc_manifest_status));
 #if NATIVE_MSDC_BLOCK_DEVICES
   else if (root) {

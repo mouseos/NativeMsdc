@@ -223,3 +223,28 @@ comparison and publication rules remain unchanged.
 Measured whole-file `vn_rdwr` throughput is not card-link bandwidth. Compare
 its interval with the existing same-boot transport and verified-root SHA
 counters; APFS/VM and other caller work remain outside those driver counters.
+
+### Experimental DMA interrupt wait
+
+`NATIVE_MSDC_IRQ_WAIT=1` compiles an experimental interrupt wait. It remains
+inactive unless both `native-msdc-dma=1` and `native-msdc-irq=1` are supplied
+and the board exposes `msdc-irq-spi`, `msdc-sysirq-base`, and `msdc-irq-low`.
+The board must provide the ArmCpu checked SYSIRQ/SPI service, a usable GICv2
+non-secure SPI and writable SYSIRQ polarity. Its SYSIRQ bank is shared; all
+writers must use the common ArmCpu controller synchronization.
+The driver attaches permanently for its host lifetime and only accepts an
+inherited zero interrupt-enable register. Initial DMA-vs-PIO testing remains
+polled. The interrupt handler only handles the currently armed DMA events. Eight
+consecutive spurious interrupts mask only the owned GIC SPI and disable IRQ waits.
+A wait checks interrupt and preemption state before blocking; other contexts
+continue polling. If no IRQ arrives in 10 ms, the driver disables this wait
+mode and continues the in-flight DMA through the original polling path and
+original one-second deadline. The DMA self-test can still reject DMA and use
+PIO. A transfer error does not trigger an unsafe blind PIO retry.
+
+`native_msdc_irq_stats` contains captured IRQs, wait attempts, missing-delivery
+fallbacks, and aggregate wait nanoseconds. It does not measure CPU time. These
+changes require XNU build/link and real-device qualification; the host tests
+model synchronization and are not physical DMA or data-integrity evidence.
+Run `python3 tests/irq-wait-host.py`, `python3 tests/irq-dma-host.py`,
+`python3 tests/irq-setup-host.py`, and `python3 tests/irq-fallback-host.py`.
