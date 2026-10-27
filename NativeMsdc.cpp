@@ -453,17 +453,18 @@ unsigned bootArgument (const char *name, unsigned maximum, unsigned fallback)
 static int verifiedCacheToken (const char *args, const char *name)
 {
   const size_t size = strlen (name);
-  if (!args) return -1;
+  int result = -1;
+  if (!args) return result;
   while (*args) {
-    while (*args == ' ' || *args == '\t' || *args == '\n' || *args == '\r') ++args;
+    while (*args == ' ' || *args == '\t') ++args;
     const char *end = args;
-    while (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') ++end;
+    while (*end && *end != ' ' && *end != '\t') ++end;
     const size_t length = size_t (end - args);
     if (length >= size && !strncmp (args, name, size) && (length == size || args[size] == '='))
-      return length == size + 2 && args[size] == '=' && args[size + 1] == '1' ? 1 : 0;
+      result = length == size + 2 && args[size] == '=' && args[size + 1] == '1' ? 1 : 0;
     args = end;
   }
-  return -1;
+  return result; // XNU processes duplicate arguments in order; the last wins.
 }
 bool verifiedCacheArgument ()
 {

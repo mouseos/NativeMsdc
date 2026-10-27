@@ -10,8 +10,8 @@ static const char *args;
 static const char *PE_boot_args(){return args;}
 '''+s[a:b]+r'''
 int main(){
- const char *yes[]={"mcv=1","native-msdc-vcache=1","mcv=0 native-msdc-vcache=1","mcv=1 mcv=0"};
- const char *no[]={"","mcv","mcv=0","mcv=2","mcv=01","mcv=4294967297","mcv=-4294967295","mcv=garbage","mcv=1 native-msdc-vcache=garbage","mcv=1 native-msdc-vcache","mcv=1 native-msdc-vcache=0","mcv=0 mcv=1","xmc v=1"};
+ const char *yes[]={"mcv=1","native-msdc-vcache=1","mcv=0 native-msdc-vcache=1","mcv=0 mcv=1"};
+ const char *no[]={"","mcv","mcv=0","mcv=2","mcv=01","mcv=4294967297","mcv=-4294967295","mcv=garbage","mcv=1 native-msdc-vcache=garbage","mcv=1 native-msdc-vcache","mcv=1 native-msdc-vcache=0","mcv=1 mcv=0","other=0\\nmcv=1","mcv=1\\rgarbage","xmc v=1"};
  for(auto v:yes){args=v;assert(verifiedCacheArgument());}
  for(auto v:no){args=v;assert(!verifiedCacheArgument());}
  args=nullptr;assert(!verifiedCacheArgument());
