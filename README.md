@@ -135,10 +135,10 @@ driver then serves the persistent store only, references no original storage sym
 
 ### Optional authenticated root snapshot cache
 
-`native-msdc-vcache=1` (exact value 1; absent/other values disable it) enables
+`native-msdc-vcache=1` or short alias `mcv=1` (exact value 1; absent/other values disable it) enables
 reuse of the last fully authenticated chunk, at most 64 KiB, in each verified
 read-only manifest window. Requires the existing `NATIVE_VERIFIED_BLOCK=1` build.
-No board default or signed policy changes are needed. Data/overlay and writable
+When both spellings are present, the long spelling takes precedence, including explicit 0 or an invalid value. No board default or signed policy changes are needed. Data/overlay and writable
 manifest windows are excluded. The existing per-window lock protects the bounce
 buffer and cache state; no new cache lock or allocation is used.
 

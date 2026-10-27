@@ -448,6 +448,17 @@ unsigned bootArgument (const char *name, unsigned maximum, unsigned fallback)
   return value;
 }
 
+// Exact long spelling has precedence, including explicit 0 or invalid values.
+// The short default-off alias fits boards with a nearly full boot command line.
+bool verifiedCacheArgument ()
+{
+  unsigned value = 0;
+  if (PE_parse_boot_argn ("native-msdc-vcache", &value, sizeof (value))) return value == 1;
+  value = 0;
+  return PE_parse_boot_argn ("mcv", &value, sizeof (value)) && value == 1;
+}
+
+
 void fail (const char *why)
 {
   native_msdc_failure = why;
@@ -1024,7 +1035,7 @@ const char *NativeMsdcBlock::configureVerification (int *status)
   verified = view;
   envelope = region + entry.offset;
   writable = false;
-  verifiedCacheEnabled = bootArgument ("native-msdc-vcache", 1, 0) == 1;
+  verifiedCacheEnabled = verifiedCacheArgument ();
   verifiedCache.metrics = native_msdc_verified_cache_stats;
   verifiedActive = true;
   return nullptr;
