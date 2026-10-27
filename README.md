@@ -239,20 +239,29 @@ consecutive spurious interrupts request masking only the owned GIC SPI and
 disable IRQ waits. ISENABLER is read back. A failed mask is counted, the
 controller interrupt-enable register is cleared, and a persistent or
 unquenchable interrupt storm panics rather than looping indefinitely.
-Only explicitly marked policy and manifest reads in the driver's own
-`kernel_thread_start` publication thread may wait; its thread identity, IRQ
-state and preemption level are checked. Initial reads, normal block I/O
-(including launchd reads), verified block callbacks, and store ABI callers
-continue polling because their complete caller/lock contracts are unproven.
-The publisher holds the host mutex across sleep; the primary IRQ handler takes
+The worker experiment queues only verified read-only windows; other windows,
+writes, and flushes retain their original synchronous path. One I/O worker
+processes a bounded FIFO. Each accepted read reserves one of 64 dedicated
+completion threads, so a callback can synchronously issue another read without
+blocking the I/O worker or relying on XNU's shared thread-call pool. Media
+credits (32) are returned when the complete read is processed; completion
+slots and references stay reserved until the callback returns. Saturation of
+either resource rejects a request with NotReady: the practical impact and
+sizing have not been measured. The stop path is nonblocking, aborts queued
+reads and retains the provider and buffers for in-flight operations.
+Callbacks may complete out of order, as independent asynchronous reads may.
+XNU runtime behavior, initialization cost and hardware performance require
+validation. A compile guard blocks the worker except isolated compilation tests.
+The publisher or worker holds the host mutex across sleep; the primary IRQ handler takes
 only a separate spin lock and never waits on that mutex. If no IRQ arrives in 10 ms, the driver disables this wait
 mode and continues the in-flight DMA through the original polling path and
 original one-second deadline. The DMA self-test can still reject DMA and use
 PIO. A transfer error does not trigger an unsafe blind PIO retry.
 
-`native_msdc_irq_stats` contains captured IRQs, wait attempts, missing-delivery
+`native_msdc_worker_stats` counts accepted, I/O-completed and rejected requests; `native_msdc_irq_stats` contains captured IRQs, wait attempts, missing-delivery
 fallbacks, and aggregate wait nanoseconds. It does not measure CPU time. These
 changes require XNU build/link and real-device qualification; the host tests
 model synchronization and are not physical DMA or data-integrity evidence.
 Run `python3 tests/irq-wait-host.py`, `python3 tests/irq-dma-host.py`,
-`python3 tests/irq-setup-host.py`, and `python3 tests/irq-fallback-host.py`.
+`python3 tests/irq-setup-host.py`, `python3 tests/irq-fallback-host.py`,
+`python3 tests/irq-caller-policy.py`, and `python3 tests/irq-worker-host.py`.

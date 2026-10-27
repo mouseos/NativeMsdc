@@ -60,6 +60,9 @@
 #ifndef NATIVE_MSDC_IRQ_WAIT
 #define NATIVE_MSDC_IRQ_WAIT 0
 #endif
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES && !defined(NATIVE_MSDC_WORKER_COMPILE_TEST)
+#error "Unqualified read worker: XNU runtime tests required"
+#endif
 #if NATIVE_MSDC_IRQ_WAIT
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
@@ -93,6 +96,8 @@ volatile uint32_t native_msdc_blocks_published = 0;
 // IRQs captured, wait attempts, delivery fallback, elapsed wait nanoseconds.
 volatile uint64_t native_msdc_irq_stats[4] = {};
 volatile uint64_t native_msdc_irq_mask_failures = 0;
+// Accepted block requests, completed I/O requests, rejected requests, reserved.
+volatile uint64_t native_msdc_worker_stats[4] = {};
 #endif
 volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flushes = 0, native_msdc_failures = 0;
 // Optional verified-root snapshot reuse: hits, misses, authenticated bytes reused.
@@ -154,6 +159,7 @@ MsdcHost gHost;
 // Only explicit publication-thread reads opt in; storage callbacks and store
 // ABI callers retain polling until their complete lock/caller contracts are proven.
 thread_t gPublisherThread = nullptr;
+thread_t gIoWorkerThread = nullptr;
 #endif
 bool gModeTelemetryEnabled; // exact native-msdc-mode=1, sampled once before bring-up
 
@@ -422,8 +428,10 @@ IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks, bool 
     uint64_t end = deadlineAfter (kCommandTimeoutNs);
 #if NATIVE_MSDC_IRQ_WAIT
 #if NATIVE_MSDC_BLOCK_DEVICES
+    thread_t self = current_thread ();
     const bool publisherContext = publisherRead &&
-      __atomic_load_n (&gPublisherThread, __ATOMIC_ACQUIRE) == current_thread ();
+      (self == __atomic_load_n (&gPublisherThread, __ATOMIC_ACQUIRE) ||
+       self == __atomic_load_n (&gIoWorkerThread, __ATOMIC_ACQUIRE));
 #else
     const bool publisherContext = false;
 #endif
@@ -1070,12 +1078,196 @@ public:
   IOReturn reportRemovability (bool *value) override { *value = false; return kIOReturnSuccess; }
   IOReturn reportWriteProtection (bool *value) override { *value = !writable; return kIOReturnSuccess; }
   IOReturn doSynchronizeCache () override;
+#if NATIVE_MSDC_IRQ_WAIT
+  IOReturn synchronizeNow ();
+  IOReturn readWriteNow (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *);
+#endif
   IOReturn doSynchronize (UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache (); }
   IOReturn getWriteCacheState (bool *value) override { *value = writable && gHost.cache; return kIOReturnSuccess; }
   IOReturn setWriteCacheState (bool) override { return kIOReturnUnsupported; }
   IOReturn doAsyncReadWrite (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
 };
 OSDefineMetaClassAndStructors (NativeMsdcBlock, IOBlockStorageDevice)
+
+#if NATIVE_MSDC_IRQ_WAIT
+// A single host worker serializes verified, immutable window reads. Writes,
+// store operations and synchronous barriers retain their original path.
+namespace {
+struct CompletionSlot;
+struct BlockJob {
+  BlockJob *next;
+  NativeMsdcBlock *owner;
+  IOMemoryDescriptor *buffer;
+  UInt64 block, count;
+  IOStorageAttributes attributes;
+  IOStorageCompletion completion;
+  CompletionSlot *slot;
+  IOReturn completionStatus;
+  UInt64 completionBytes;
+  bool hasAttributes, completed, ready;
+};
+struct CompletionSlot { BlockJob *job; };
+// Each accepted request reserves exactly one dedicated completion thread.
+// A nested request with no free slot fails to start, so even 32 callbacks
+// synchronously waiting for nested I/O cannot deadlock a completion pool.
+// Separate media credits (including the active request) from completion
+// threads, whose slots remain reserved until their callback returns.
+constexpr unsigned kBlockQueueLimit = 32, kCompletionSlots = 64;
+IOLock *gBlockQueueLock = nullptr;
+BlockJob *gBlockHead = nullptr, *gBlockTail = nullptr;
+CompletionSlot gBlockSlots[kCompletionSlots] = {};
+unsigned gBlockQueued = 0, gBlockIoPending = 0, gBlockOutstanding = 0, gBlockDirect = 0;
+bool gBlockAccept = false, gBlockRunning = false, gBlockEnabled = false;
+bool gBlockPoolShutdown = false, gBlockPoolReady = false;
+IOService *gBlockParent = nullptr;
+
+void blockQueueAppend (BlockJob *job)
+{
+  job->next = nullptr;
+  if (gBlockTail) gBlockTail->next = job; else gBlockHead = job;
+  gBlockTail = job;
+  ++gBlockQueued;
+  IOLockWakeup (gBlockQueueLock, &gBlockHead, false);
+}
+
+void blockCapture (void *target, void *, IOReturn status, UInt64 bytes)
+{
+  BlockJob *job = static_cast<BlockJob *> (target);
+  job->completionStatus = status; job->completionBytes = bytes; job->completed = true;
+}
+
+void blockCompletionWorker (void *argument, wait_result_t)
+{
+  CompletionSlot *slot = static_cast<CompletionSlot *> (argument);
+  IOLockLock (gBlockQueueLock);
+  for (;;) {
+    while ((!slot->job || !slot->job->ready) && (!gBlockPoolShutdown || slot->job))
+      IOLockSleep (gBlockQueueLock, slot, THREAD_UNINT);
+    if (!slot->job && gBlockPoolShutdown) break;
+    BlockJob *job = slot->job;
+    IOLockUnlock (gBlockQueueLock);
+    job->completion.action (job->completion.target, job->completion.parameter,
+                            job->completionStatus, job->completionBytes);
+    job->buffer->release ();
+    job->owner->release ();
+    IOLockLock (gBlockQueueLock);
+    slot->job = nullptr;
+    --gBlockOutstanding;
+    IOLockUnlock (gBlockQueueLock);
+    IOFree (job, sizeof (*job));
+    IOLockLock (gBlockQueueLock);
+  }
+  IOLockUnlock (gBlockQueueLock);
+  gBlockParent->release ();
+}
+
+void blockWorker (void *, wait_result_t)
+{
+  __atomic_store_n (&gIoWorkerThread, current_thread (), __ATOMIC_RELEASE);
+  IOLockLock (gBlockQueueLock);
+  for (;;) {
+    while (!gBlockHead && gBlockAccept) IOLockSleep (gBlockQueueLock, &gBlockHead, THREAD_UNINT);
+    if (!gBlockHead && !gBlockAccept) break;
+    BlockJob *job = gBlockHead;
+    gBlockHead = job->next;
+    if (!gBlockHead) gBlockTail = nullptr;
+    --gBlockQueued;
+    bool cancelled = !gBlockAccept;
+    IOLockUnlock (gBlockQueueLock);
+    IOStorageCompletion proxy = { job, blockCapture, nullptr };
+    IOReturn result = cancelled ? kIOReturnAborted :
+      job->owner->readWriteNow (job->buffer, job->block, job->count,
+                                job->hasAttributes ? &job->attributes : nullptr, &proxy);
+    if (result != kIOReturnSuccess) blockCapture (job, nullptr, result, 0);
+    if (!job->completed) blockCapture (job, nullptr, kIOReturnError, 0);
+    __atomic_fetch_add (&native_msdc_worker_stats[1], 1, __ATOMIC_RELAXED);
+    IOLockLock (gBlockQueueLock);
+    --gBlockIoPending; // media credit is independent of callback lifetime
+    job->ready = true;
+    IOLockWakeup (gBlockQueueLock, job->slot, false);
+  }
+  __atomic_store_n (&gIoWorkerThread, static_cast<thread_t> (nullptr), __ATOMIC_RELEASE);
+  gBlockRunning = false;
+  IOLockWakeup (gBlockQueueLock, &gBlockRunning, false);
+  IOLockUnlock (gBlockQueueLock);
+  gBlockParent->release ();
+}
+
+void stopBlockWorker ()
+{
+  if (!gBlockQueueLock) return;
+  IOLockLock (gBlockQueueLock);
+  gBlockAccept = false; gBlockPoolShutdown = true;
+  IOLockWakeup (gBlockQueueLock, &gBlockHead, false);
+  for (unsigned i = 0; i < kCompletionSlots; ++i) IOLockWakeup (gBlockQueueLock, &gBlockSlots[i], false);
+  IOLockUnlock (gBlockQueueLock);
+  // Never wait under an upper-layer lock. Every thread retains the provider;
+  // queued reads are aborted and in-flight work keeps its resources alive.
+}
+
+bool startBlockWorker (IOService *parent)
+{
+  if (!gHost.irqReady) return false;
+  gBlockQueueLock = IOLockAlloc ();
+  if (!gBlockQueueLock) return false;
+  gBlockParent = parent; gBlockAccept = true; gBlockEnabled = true;
+  for (unsigned i = 0; i < kCompletionSlots; ++i) {
+    thread_t thread = nullptr;
+    parent->retain ();
+    if (kernel_thread_start (blockCompletionWorker, &gBlockSlots[i], &thread) != KERN_SUCCESS) {
+      parent->release ();
+      IOLockLock (gBlockQueueLock); gBlockPoolShutdown = true;
+      for (unsigned j = 0; j < kCompletionSlots; ++j) IOLockWakeup (gBlockQueueLock, &gBlockSlots[j], false);
+      IOLockUnlock (gBlockQueueLock);
+      return false;
+    }
+    thread_deallocate (thread);
+  }
+  thread_t thread = nullptr;
+  parent->retain ();
+  if (kernel_thread_start (blockWorker, nullptr, &thread) != KERN_SUCCESS) {
+    parent->release ();
+    IOLockLock (gBlockQueueLock); gBlockPoolShutdown = true;
+    for (unsigned j = 0; j < kCompletionSlots; ++j) IOLockWakeup (gBlockQueueLock, &gBlockSlots[j], false);
+    IOLockUnlock (gBlockQueueLock);
+    return false;
+  }
+  gBlockRunning = true;
+  gBlockPoolReady = true;
+  thread_deallocate (thread);
+  return true;
+}
+
+// The logical start is recorded under the same lock as stop; operations
+// admitted before stop keep the provider alive until their direct path ends.
+bool blockDirectBegin ()
+{
+  IOLockLock (gBlockQueueLock);
+  bool allowed = gBlockAccept;
+  if (allowed) { ++gBlockDirect; gBlockParent->retain (); }
+  IOLockUnlock (gBlockQueueLock);
+  return allowed;
+}
+void blockDirectEnd ()
+{
+  IOLockLock (gBlockQueueLock);
+  --gBlockDirect;
+  IOLockUnlock (gBlockQueueLock);
+  gBlockParent->release ();
+}
+
+class OptionalBlockDirectGuard {
+  bool held = false, allowed = true;
+public:
+  OptionalBlockDirectGuard () {
+    if (gBlockEnabled) { allowed = blockDirectBegin (); held = allowed; }
+  }
+  ~OptionalBlockDirectGuard () { if (held) blockDirectEnd (); }
+  bool ok () const { return allowed; }
+};
+
+}
+#endif
 
 bool NativeMsdcBlock::configure (unsigned index, const RootWindow &entry, uint64_t absoluteSector, bool allowWrites)
 {
@@ -1112,6 +1304,17 @@ bool NativeMsdcBlock::start (IOService *provider)
 
 IOReturn NativeMsdcBlock::doSynchronizeCache ()
 {
+#if NATIVE_MSDC_IRQ_WAIT
+  if (!gBlockEnabled) return synchronizeNow ();
+  if (!blockDirectBegin ()) return kIOReturnNotReady;
+  IOReturn result = synchronizeNow ();
+  blockDirectEnd ();
+  return result;
+}
+
+IOReturn NativeMsdcBlock::synchronizeNow ()
+{
+#endif
   if (!online) return kIOReturnNotReady;
   if (!writable) return kIOReturnSuccess;
   if (gHost.poisoned) return kIOReturnNotReady;
@@ -1122,6 +1325,54 @@ IOReturn NativeMsdcBlock::doSynchronizeCache ()
 IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                             IOStorageAttributes *attributes, IOStorageCompletion *completion)
 {
+#if NATIVE_MSDC_IRQ_WAIT
+  if (gBlockEnabled) {
+    IOLockLock (gBlockQueueLock); bool accepting = gBlockAccept; IOLockUnlock (gBlockQueueLock);
+    if (!accepting) return kIOReturnNotReady;
+  }
+#if NATIVE_MSDC_VERIFIED
+  if (gBlockEnabled && gBlockPoolReady && verifiedActive && manifestReadOnly && !writable && buffer &&
+      buffer->getDirection () == kIODirectionIn) {
+    if (!completion || !completion->action) return kIOReturnBadArgument;
+    BlockJob *job = static_cast<BlockJob *> (IOMalloc (sizeof (BlockJob)));
+    if (!job) return kIOReturnNoMemory;
+    *job = {}; job->owner = this; job->buffer = buffer; job->block = block; job->count = count;
+    job->completion = *completion; job->hasAttributes = attributes != nullptr;
+    if (attributes) job->attributes = *attributes;
+    retain (); buffer->retain ();
+    IOLockLock (gBlockQueueLock);
+    if (!gBlockAccept || gBlockIoPending >= kBlockQueueLimit) {
+      IOLockUnlock (gBlockQueueLock);
+      buffer->release (); release (); IOFree (job, sizeof (*job));
+      __atomic_fetch_add (&native_msdc_worker_stats[2], 1, __ATOMIC_RELAXED);
+      return kIOReturnNotReady;
+    }
+    CompletionSlot *slot = nullptr;
+    for (unsigned i = 0; i < kCompletionSlots; ++i) if (!gBlockSlots[i].job) { slot = &gBlockSlots[i]; break; }
+    if (!slot) {
+      IOLockUnlock (gBlockQueueLock);
+      buffer->release (); release (); IOFree (job, sizeof (*job));
+      __atomic_fetch_add (&native_msdc_worker_stats[2], 1, __ATOMIC_RELAXED);
+      return kIOReturnNotReady;
+    }
+    slot->job = job; job->slot = slot; ++gBlockOutstanding; ++gBlockIoPending;
+    blockQueueAppend (job);
+    __atomic_fetch_add (&native_msdc_worker_stats[0], 1, __ATOMIC_RELAXED);
+    IOLockUnlock (gBlockQueueLock);
+    return kIOReturnSuccess;
+  }
+#endif // NATIVE_MSDC_VERIFIED
+  if (!gBlockEnabled) return readWriteNow (buffer, block, count, attributes, completion);
+  if (!blockDirectBegin ()) return kIOReturnNotReady;
+  IOReturn result = readWriteNow (buffer, block, count, attributes, completion);
+  blockDirectEnd ();
+  return result;
+}
+
+IOReturn NativeMsdcBlock::readWriteNow (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+                                         IOStorageAttributes *attributes, IOStorageCompletion *completion)
+{
+#endif
 #if NATIVE_MSDC_VERIFIED
   const uint64_t configuration = verifiedActive ?
     __atomic_load_n (&verifiedConfiguration, __ATOMIC_ACQUIRE) : 0;
@@ -1159,7 +1410,7 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
       result = buffer->readBytes (offset, gHost.bounce, bytes) == bytes ?
         transfer (firstSector + block + done, blocks, gHost.bounce, true) : kIOReturnIOError;
     } else {
-      result = transfer (firstSector + block + done, blocks, gHost.bounce, false);
+      result = transfer (firstSector + block + done, blocks, gHost.bounce, false, true);
       if (result == kIOReturnSuccess && buffer->writeBytes (offset, gHost.bounce, bytes) != bytes) result = kIOReturnIOError;
     }
     if (result == kIOReturnSuccess) done += blocks;
@@ -1249,7 +1500,7 @@ IOReturn NativeMsdcBlock::readVerified (IOMemoryDescriptor *buffer, UInt64 block
       return verifiedTimedOperation (gRootTimingEnabled, native_msdc_verified_timing_stats, 0,
         uint64_t (blocks) * kSector, rootTimingNow, [&] () {
           HostSession session;
-          return transfer (firstSector + windowSector, blocks, out, false);
+          return transfer (firstSector + windowSector, blocks, out, false, true);
         });
     }
     int verify (uint64_t index, const uint8_t *data, size_t length)
@@ -1508,8 +1759,23 @@ bool NativeMsdc::start (IOService *provider)
   if (!gHost.manifestValid) fail (manifestReason (native_msdc_manifest_status));
 #if NATIVE_MSDC_BLOCK_DEVICES
   else if (root) {
+#if NATIVE_MSDC_IRQ_WAIT
+    if (gHost.irqReady && !startBlockWorker (this)) {
+      if (!gBlockEnabled) {
+        fail ("block worker lifecycle lock unavailable");
+        IOService::stop (provider);
+        return false;
+      }
+      IOLog ("NativeMsdc: block worker unavailable; polling\n");
+    }
+#endif
     gVerifyWindows = bootArgument ("native-msdc-verify", 1, 0) == 1;
-    if (!startRoot (root == 2, &why)) fail (why);
+    if (!startRoot (root == 2, &why)) {
+#if NATIVE_MSDC_IRQ_WAIT
+      stopBlockWorker ();
+#endif
+      fail (why);
+    }
   }
 #else
   else if (root) fail ("native-msdc-root: built without the window block devices (NATIVE_MSDC_BLOCK_DEVICES=0)");
@@ -1561,6 +1827,9 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 
 void NativeMsdc::stop (IOService *provider)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+  stopBlockWorker ();
+#endif
   // Published windows may still have clients; the host stays as it is.
   IOService::stop (provider);
 }
@@ -1606,6 +1875,10 @@ extern "C" unsigned native_msdc_store_mode (void) { return storeMode (); }
 // Returns 1 and the first absolute 512-byte sector of the window, 0 on refusal (reason in *why, may be null).
 extern "C" int native_msdc_store_open (uint64_t blocks, uint64_t *firstSector, const char **why)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
   const char *reason = "";
   int ok = 0;
   if (!storeMode ()) reason = "off";
@@ -1638,11 +1911,19 @@ extern "C" int native_msdc_store_open (uint64_t blocks, uint64_t *firstSector, c
 
 extern "C" int native_msdc_store_read (uint64_t relative, uint32_t blocks, void *destination)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
   return storeTransfer (relative, blocks, static_cast<uint8_t *> (destination), false);
 }
 
 extern "C" int native_msdc_store_write (uint64_t relative, uint32_t blocks, const void *source)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
   if (storeMode () != 2) return 0;
   // transfer() only reads from the buffer on a write.
   if (!storeTransfer (relative, blocks, static_cast<uint8_t *> (const_cast<void *> (source)), true)) return 0;
@@ -1652,6 +1933,10 @@ extern "C" int native_msdc_store_write (uint64_t relative, uint32_t blocks, cons
 
 extern "C" int native_msdc_store_sync (void)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
   if (storeMode () != 2 || !gStoreBlocks || gHost.poisoned) return 0;
   HostSession session;
   return hostFlush () == kIOReturnSuccess;
@@ -1660,6 +1945,10 @@ extern "C" int native_msdc_store_sync (void)
 // Re-read the GPT header and entry array and compare their CRCs with those recorded at start. 0 = unchanged.
 extern "C" unsigned native_msdc_store_gpt_check (void)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 1;
+#endif
   if (!gHost.ready || !gHost.layoutValid || gHost.poisoned) return 1;
   HostSession session;
   if (transfer (kGptHeaderLba, 1, gHost.bounce, false) != kIOReturnSuccess) return 2;
