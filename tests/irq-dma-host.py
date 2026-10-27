@@ -32,6 +32,7 @@ using thread_t=void*;thread_t gPublisherThread=reinterpret_cast<void*>(1);
 thread_local thread_t activeThread=reinterpret_cast<void*>(1);thread_t gIoWorkerThread=reinterpret_cast<void*>(3);thread_t current_thread(){return activeThread;}
 #define NATIVE_MSDC_BLOCK_DEVICES 1
 #define NATIVE_MSDC_IRQ_WAIT 1
+#define NATIVE_MSDC_WORKER_EXPERIMENT 1
 #define IOLog(...) do {} while(0)
 '''
 post=r'''

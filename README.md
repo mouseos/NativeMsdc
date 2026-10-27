@@ -239,26 +239,28 @@ consecutive spurious interrupts request masking only the owned GIC SPI and
 disable IRQ waits. ISENABLER is read back. A failed mask is counted, the
 controller interrupt-enable register is cleared, and a persistent or
 unquenchable interrupt storm panics rather than looping indefinitely.
-The worker experiment queues only verified read-only windows; other windows,
-writes, and flushes retain their original synchronous path. One I/O worker
-processes a bounded FIFO. Each accepted read reserves one of 64 dedicated
-completion threads, so a callback can synchronously issue another read without
-blocking the I/O worker or relying on XNU's shared thread-call pool. Media
-credits (32) are returned when the complete read is processed; completion
-slots and references stay reserved until the callback returns. Saturation of
-either resource rejects a request with NotReady: the practical impact and
-sizing have not been measured. The stop path is nonblocking, aborts queued
-reads and retains the provider and buffers for in-flight operations.
-Callbacks may complete out of order, as independent asynchronous reads may.
-XNU runtime behavior, initialization cost and hardware performance require
-validation. A compile guard blocks the worker except isolated compilation tests.
+The worker experiment queues only verified read-only windows; writable windows,
+writes and flushes retain their original synchronous path. One I/O worker
+processes admitted reads in FIFO order. Each read reserves a dedicated
+completion thread, starting with one and growing on demand to at most 64;
+there are 32 I/O credits. The I/O credit is returned after reading and copying,
+while the completion slot and references remain until the callback returns.
+A request that cannot allocate its queue record or obtain a credit, completion
+slot or new thread uses the original synchronous polled path, rather than returning a new capacity error.
+Such a fallback immutable read can overtake queued reads. A stopped device
+rejects new requests; stop does not wait for callbacks, aborts unstarted queued
+reads, and retains the provider and buffers for in-flight operations. Callback
+completion order is not guaranteed. The actual XNU runtime, demand growth cost,
+stop boundary and hardware performance require validation. The worker is
+compiled out unless `NATIVE_MSDC_WORKER_EXPERIMENT=1` is explicitly supplied
+with IRQ wait, block devices and verified root.
 The publisher or worker holds the host mutex across sleep; the primary IRQ handler takes
 only a separate spin lock and never waits on that mutex. If no IRQ arrives in 10 ms, the driver disables this wait
 mode and continues the in-flight DMA through the original polling path and
 original one-second deadline. The DMA self-test can still reject DMA and use
 PIO. A transfer error does not trigger an unsafe blind PIO retry.
 
-`native_msdc_worker_stats` counts accepted, I/O-completed and rejected requests; `native_msdc_irq_stats` contains captured IRQs, wait attempts, missing-delivery
+`native_msdc_worker_stats` counts queued, I/O-completed and saturation/thread-start fallback requests; `native_msdc_irq_stats` contains captured IRQs, wait attempts, missing-delivery
 fallbacks, and aggregate wait nanoseconds. It does not measure CPU time. These
 changes require XNU build/link and real-device qualification; the host tests
 model synchronization and are not physical DMA or data-integrity evidence.
