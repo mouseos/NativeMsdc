@@ -729,7 +729,7 @@ void hostEnableIrq (IOService *provider)
       !lowData || lowData->getLength () != 4 || !gHost.dmaEnabled) {
     IOLog ("NativeMsdc: IRQ unavailable metadata spi=%u base=%u low=%u dma=%u\n",
            spiData ? spiData->getLength () : 0, baseData ? baseData->getLength () : 0,
-           lowData ? lowData->getLength () : 0, gHost.dmaEnabled);
+           lowData ? lowData->getLength () : 0, unsigned (gHost.dmaEnabled));
     return;
   }
   uint32_t spi = 0, low = 0; uint64_t base = 0;
@@ -737,7 +737,8 @@ void hostEnableIrq (IOService *provider)
   memcpy (&base, baseData->getBytesNoCopy (), 8);
   memcpy (&low, lowData->getBytesNoCopy (), 4);
   if (spi >= 256 || low != 1 || !base || (base & 3) || (base & 4095) + 32 > 4096) {
-    IOLog ("NativeMsdc: IRQ unavailable invalid wiring spi=%u low=%u base=0x%llx\n", spi, low, base);
+    IOLog ("NativeMsdc: IRQ unavailable invalid wiring spi=%u low=%u base=0x%llx\n", spi, low,
+           static_cast<unsigned long long> (base));
     return;
   }
   HostSession session;
@@ -750,8 +751,8 @@ void hostEnableIrq (IOService *provider)
   gHost.sysirqMap = memory ? memory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
   OSSafeReleaseNULL (memory);
   if (!gHost.irqLock || !gHost.sysirqMap) {
-    IOLog ("NativeMsdc: IRQ unavailable allocation lock=%u mapping=%u\n", gHost.irqLock != nullptr,
-           gHost.sysirqMap != nullptr);
+    IOLog ("NativeMsdc: IRQ unavailable allocation lock=%u mapping=%u\n", unsigned (gHost.irqLock != nullptr),
+           unsigned (gHost.sysirqMap != nullptr));
     if (gHost.irqLock) IOSimpleLockFree (gHost.irqLock);
     gHost.irqLock = nullptr;
     OSSafeReleaseNULL (gHost.sysirqMap);
@@ -764,7 +765,7 @@ void hostEnableIrq (IOService *provider)
   IOReturn status = armcpu_spi_attach_sysirq (spi, polarity, dmaIrq, nullptr, &readback, &target, &installed);
   if (status != kIOReturnSuccess && !installed) {
     IOLog ("NativeMsdc: IRQ unavailable attach status=0x%x spi=%u gic=0x%x target=0x%llx\n",
-           status, spi, readback, target);
+           unsigned (status), spi, readback, static_cast<unsigned long long> (target));
     IOSimpleLockFree (gHost.irqLock); gHost.irqLock = nullptr;
     OSSafeReleaseNULL (gHost.sysirqMap);
     return;
