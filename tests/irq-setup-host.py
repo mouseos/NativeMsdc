@@ -36,10 +36,14 @@ int main(){HostSession session;uint32_t spi=78,low=1;uint64_t base=0x10200620;
  inherited=0;low=0;hostEnableIrq(&provider,session);assert(attaches==0);low=1;
  failMap=true;hostEnableIrq(&provider,session);assert(!gHost.irqLock && !gHost.sysirqMap);failMap=false;
  unsigned idx=(0x620+8)/4;uint32_t bit=1u<<14;regs[idx]=0x100;attachResult=1;
- hostEnableIrq(&provider,session);assert(attaches==1 && regs[idx]==0x100 && !gHost.irqLock);
+ // Observed GIC diagnostic 0x21d: Group1 readback failed, all other
+ // configuration checks passed, target is boot CPU 1. It remains terminal.
+ attachReadback=0x21d;attachTarget=1;
+ hostEnableIrq(&provider,session);assert(attaches==1 && regs[idx]==0x100 && !gHost.irqLock && !gHost.sysirqMap && !gHost.irqReady);
+ gActivationStopped=true;hostEnableIrq(&provider,session);assert(attaches==1 && !gHost.irqReady && !gHost.irqLock && !gHost.sysirqMap);gActivationStopped=false;
  attachResult=2;hostEnableIrq(&provider,session);assert(!gHost.irqReady && gHost.irqLock && !(regs[idx]&bit));
  gHost={};gHost.dmaEnabled=true;attachResult=0;attachReadback=0xa003;hostEnableIrq(&provider,session);assert(gHost.irqReady && (regs[idx]&bit));
- puts("PASS actual IRQ setup: metadata, inherited mask, map failure, rollback, readback refusal, valid GIC target");}
+ puts("PASS actual IRQ setup: 0x21d Group1 refusal, stop cancellation, rollback and valid GIC target");}
 '''
 with tempfile.TemporaryDirectory(prefix='msdc-setup-') as d:
  p=Path(d)/'a.cpp';x=Path(d)/'a';p.write_text(pre+body+post)

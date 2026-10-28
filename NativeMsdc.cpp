@@ -1378,12 +1378,12 @@ bool NativeMsdcBlock::configure (unsigned index, const RootWindow &entry, uint64
 
 bool NativeMsdcBlock::start (IOService *provider)
 {
-  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || isInactive ()) return false;
+  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || provider->isInactive () || isInactive ()) return false;
   if (!IOBlockStorageDevice::start (provider)) return false;
   // The provider and its attached children become inactive in termination
   // phase 1. startMatching also rejects an inactive service under IOKit's
   // arbitration lock, even if termination races this check.
-  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || isInactive ()) return false;
+  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || provider->isInactive () || isInactive ()) return false;
   online = true;
   registerService ();
   return true;

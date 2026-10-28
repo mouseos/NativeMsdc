@@ -31,11 +31,12 @@ int clear_wait(thread_t,int){return 0;}void thread_wakeup(event_t){std::lock_gua
 #define THREAD_CONTINUE_NULL nullptr
 int thread_block(void*){std::unique_lock<std::mutex> l(events);cv.wait(l,[]{return signaled;});signaled=false;return 0;}
 void IOSleep(unsigned){std::this_thread::yield();}
-struct IOService {virtual void stop(IOService*){} virtual ~IOService()=default;};
+extern std::atomic<bool> parentInactive;
+struct IOService {virtual bool isInactive(){return parentInactive;} virtual void stop(IOService*){} virtual ~IOService()=default;};
 struct NativeMsdcBlock;
 std::atomic<bool> parentInactive{false},childInactive{false},entered{false},go{false};int matched=0;bool gate=false;
-struct NativeMsdc:IOService {std::atomic<int> refs{1};bool isInactive(){return parentInactive;}bool terminate(int){if(attempts++<failAttempts)return false;std::lock_guard<std::mutex> l(arb);parentInactive=true;childInactive=true;return true;}void retain(){++refs;}void release(){--refs;}void stop(IOService*) override;};
-struct IOBlockStorageDevice:IOService {bool isInactive(){return childInactive;}bool start(IOService*){return true;}};
+struct NativeMsdc:IOService {std::atomic<int> refs{1};bool isInactive() override{return parentInactive;}bool terminate(int){if(attempts++<failAttempts)return false;std::lock_guard<std::mutex> l(arb);parentInactive=true;childInactive=true;return true;}void retain(){++refs;}void release(){--refs;}void stop(IOService*) override;};
+struct IOBlockStorageDevice:IOService {bool isInactive() override{return childInactive;}bool start(IOService*){return true;}};
 struct NativeMsdcBlock:IOBlockStorageDevice {bool online=false;bool start(IOService*);void registerService(){entered=true;while(gate&&!go)std::this_thread::yield();std::lock_guard<std::mutex> l(arb);if(!childInactive)++matched;}};
 '''
 post=r'''
