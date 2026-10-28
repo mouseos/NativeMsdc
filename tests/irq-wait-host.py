@@ -10,7 +10,8 @@ start = src.index('constexpr uint32_t kDmaEvents')
 end = src.index('\n#endif', start)
 actual = src[start:end]
 assert 'if (result == kIOReturnNotReady)' in src
-assert 'else if (gHost.dmaEnabled) result = hostReadDma' in src
+assert 'const bool dmaRead = !write && gHost.dmaEnabled' in src
+assert 'else if (dmaRead) result = hostReadDma' in src
 assert 'else result = hostReadPio' in src
 prefix = r'''
 #include <atomic>

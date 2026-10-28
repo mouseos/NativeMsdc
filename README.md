@@ -318,3 +318,24 @@ still active. In the XNU single-provider path `requestTerminate` delegates to
 before the later stop action. A nonzero count is evidence that this expected
 lifecycle ordering was not observed; it does not itself repair direct-stop
 publication races or guarantee a complete teardown.
+
+Optional `native-msdc-iostat=1` adds cumulative diagnostics, disabled by
+default. `native_msdc_transport_stats` contains [DMA read, PIO read, write]
+by [<=4 KiB, 4–16 KiB, >16 KiB] and four counters per bin: calls, successful
+bytes, failures, and total elapsed nanoseconds including failures. It measures
+physical `transfer()` calls, not individual user requests; it excludes time
+waiting for the host mutex and time spent in verified-root hashing. DMA time
+includes polling or IRQ wait, controller work and the DMA bounce copy. Using
+successful-byte deltas divided by the elapsed interval gives an observed
+average rate, not a hardware bus bandwidth measurement; dividing by summed
+transfer time includes failed calls. Existing PIO self-test is outside this
+measurement. The optional block-offer array contains requested calls and bytes
+by read/write and size, before validation/completion; it is not a count of
+successful requests and contains no per-process identity. Worker queue stats
+count executed jobs, cumulative queue wait and maximum queue wait; canceled
+jobs and direct-path reads are excluded. Clock reads, conversions and atomic
+updates add diagnostic overhead per transfer or queued request. Counters are
+individually atomic, not a simultaneous snapshot. This does not measure memory
+bandwidth, CPU time, network or GPU utilization, or end-to-end per-request
+latency. Tests: `python3 tests/irq-fallback-host.py` and
+`python3 tests/irq-worker-host.py`.

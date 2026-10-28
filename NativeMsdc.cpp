@@ -112,6 +112,14 @@ volatile uint64_t native_msdc_reads = 0, native_msdc_writes = 0, native_msdc_flu
 volatile uint64_t native_msdc_verified_cache_stats[3] = {};
 // read calls/requested bytes/ns, verify calls/bytes/ns; no hot-path logging.
 volatile uint64_t native_msdc_verified_timing_stats[6] = {};
+// Optional diagnostics: transport [DMA read, PIO read, write][size][calls,
+// successful bytes, failures, elapsed ns], and block offered [read, write]
+// [size][requests, requested bytes]. Counters are independently sampled.
+volatile uint32_t native_msdc_iostat_enabled = 0;
+volatile uint64_t native_msdc_transport_stats[36] = {};
+volatile uint64_t native_msdc_block_offer_stats[12] = {};
+// Jobs dequeued for execution, cumulative queue wait ns, maximum queue wait ns.
+volatile uint64_t native_msdc_block_queue_stats[3] = {};
 void native_root_timing_snapshot (uint64_t out[6])
 {
   for (unsigned i = 0; i < 6; ++i)
@@ -163,6 +171,11 @@ struct MsdcHost {
   bool manifestValid;
 };
 MsdcHost gHost;
+bool gIoTimingEnabled = false;
+unsigned ioSizeBin (uint64_t bytes)
+{
+  return bytes <= 4096 ? 0 : bytes <= 16384 ? 1 : 2;
+}
 #if NATIVE_MSDC_BLOCK_DEVICES
 bool gPublisherStopped = false;
 // 0 waiting, 1 stop requested, 2 publisher could not be started.
@@ -597,10 +610,23 @@ IOReturn transfer (uint64_t sector, uint32_t blocks, uint8_t *buffer, bool write
   if (gHost.poisoned) return kIOReturnNotReady;
   if (!blocks || blocks > kMaxBlocks || sector >= gHost.diskSectors || blocks > gHost.diskSectors - sector)
     return kIOReturnBadArgument;
+  const bool measure = gIoTimingEnabled;
+  const bool dmaRead = !write && gHost.dmaEnabled;
+  const uint64_t began = measure ? mach_absolute_time () : 0;
   IOReturn result;
   if (write) result = hostWrite (uint32_t (sector), buffer, blocks);
-  else if (gHost.dmaEnabled) result = hostReadDma (uint32_t (sector), buffer, blocks, publisherRead);
+  else if (dmaRead) result = hostReadDma (uint32_t (sector), buffer, blocks, publisherRead);
   else result = hostReadPio (kCmdReadSingle, uint32_t (sector), buffer, blocks);
+  if (measure) {
+    uint64_t elapsed = 0;
+    absolutetime_to_nanoseconds (mach_absolute_time () - began, &elapsed);
+    uint64_t bytes = uint64_t (blocks) * kSector;
+    unsigned index = ((write ? 2 : dmaRead ? 0 : 1) * 3 + ioSizeBin (bytes)) * 4;
+    __atomic_fetch_add (&native_msdc_transport_stats[index], 1, __ATOMIC_RELAXED);
+    if (result == kIOReturnSuccess) __atomic_fetch_add (&native_msdc_transport_stats[index + 1], bytes, __ATOMIC_RELAXED);
+    else __atomic_fetch_add (&native_msdc_transport_stats[index + 2], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add (&native_msdc_transport_stats[index + 3], elapsed, __ATOMIC_RELAXED);
+  }
   if (result != kIOReturnSuccess) __atomic_fetch_add (&native_msdc_failures, 1, __ATOMIC_RELAXED);
   else __atomic_fetch_add (write ? &native_msdc_writes : &native_msdc_reads, 1, __ATOMIC_RELAXED);
   return result;
@@ -1152,6 +1178,7 @@ struct BlockJob {
   NativeMsdcBlock *owner;
   IOMemoryDescriptor *buffer;
   UInt64 block, count;
+  uint64_t enqueuedAt;
   IOStorageAttributes attributes;
   IOStorageCompletion completion;
   CompletionSlot *slot;
@@ -1226,6 +1253,15 @@ void blockWorker (void *, wait_result_t)
     if (!gBlockHead) gBlockTail = nullptr;
     --gBlockQueued;
     bool cancelled = !gBlockAccept;
+    if (!cancelled && gIoTimingEnabled && job->enqueuedAt) {
+      uint64_t elapsed = 0;
+      absolutetime_to_nanoseconds (mach_absolute_time () - job->enqueuedAt, &elapsed);
+      __atomic_fetch_add (&native_msdc_block_queue_stats[0], 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&native_msdc_block_queue_stats[1], elapsed, __ATOMIC_RELAXED);
+      uint64_t max = __atomic_load_n (&native_msdc_block_queue_stats[2], __ATOMIC_RELAXED);
+      while (elapsed > max && !__atomic_compare_exchange_n (&native_msdc_block_queue_stats[2], &max, elapsed,
+                                                            false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { }
+    }
     IOLockUnlock (gBlockQueueLock);
     IOStorageCompletion proxy = { job, blockCapture, nullptr };
     IOReturn result = cancelled ? kIOReturnAborted :
@@ -1418,6 +1454,18 @@ IOReturn NativeMsdcBlock::synchronizeNow ()
 IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                             IOStorageAttributes *attributes, IOStorageCompletion *completion)
 {
+  // Offered block requests, not completions: later validation, verification,
+  // queue saturation or media errors can change the outcome. No user data or
+  // process identity is logged and completion lifetime is unchanged.
+  if (gIoTimingEnabled && buffer && count && count <= UINT64_MAX / kSector) {
+    IODirection direction = buffer->getDirection ();
+    if (direction == kIODirectionIn || direction == kIODirectionOut) {
+      uint64_t bytes = count * kSector;
+      unsigned index = ((direction == kIODirectionOut ? 1 : 0) * 3 + ioSizeBin (bytes)) * 2;
+      __atomic_fetch_add (&native_msdc_block_offer_stats[index], 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add (&native_msdc_block_offer_stats[index + 1], bytes, __ATOMIC_RELAXED);
+    }
+  }
 #if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_WORKER_EXPERIMENT
   if (__atomic_load_n (&gBlockEnabled, __ATOMIC_ACQUIRE)) {
     IOLockLock (gBlockQueueLock); bool accepting = gBlockAccept; IOLockUnlock (gBlockQueueLock);
@@ -1477,6 +1525,7 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
       return result;
     }
     slot->job = job; job->slot = slot; ++gBlockOutstanding; ++gBlockIoPending;
+    job->enqueuedAt = gIoTimingEnabled ? mach_absolute_time () : 0;
     blockQueueAppend (job);
     __atomic_fetch_add (&native_msdc_worker_stats[0], 1, __ATOMIC_RELAXED);
     IOLockUnlock (gBlockQueueLock);
@@ -1968,6 +2017,8 @@ bool NativeMsdc::start (IOService *provider)
 #if NATIVE_MSDC_VERIFIED
   gRootTimingEnabled = bootArgument ("native-root-timing", 1, 0) == 1;
 #endif
+  gIoTimingEnabled = bootArgument ("native-msdc-iostat", 1, 0) == 1;
+  __atomic_store_n (&native_msdc_iostat_enabled, gIoTimingEnabled ? 1u : 0u, __ATOMIC_RELEASE);
   unsigned root = bootArgument ("native-msdc-root", 2, 0);
   unsigned persist = bootArgument ("native-msdc-persist", 2, 0);
   unsigned dma = bootArgument ("native-msdc-dma", 1, 0);

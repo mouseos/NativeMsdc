@@ -5,6 +5,7 @@ import os,shlex,subprocess,tempfile
 s=(Path(__file__).resolve().parents[1]/'NativeMsdc.cpp').read_text()
 start=s.index('struct CompletionSlot;');end=s.index('\n#endif\n\nbool NativeMsdcBlock::configure',start)
 queue=s[start:end];assert queue.endswith('\n}')
+sizebin=s[s.index('unsigned ioSizeBin ('):s.index('\n#if NATIVE_MSDC_BLOCK_DEVICES',s.index('unsigned ioSizeBin ('))]
 queue=queue[:-2] # outer namespace closing, since the mock runs in global namespace
 start=s.index('IOReturn NativeMsdcBlock::doSynchronizeCache ()');end=s.index('\nIOReturn NativeMsdcBlock::synchronizeNow ()',start)
 sync=s[start:end]+'\n#endif\n'
@@ -27,9 +28,11 @@ constexpr int kIOReturnSuccess=0,kIOReturnNotReady=1,kIOReturnNoMemory=2,kIORetu
 #define NATIVE_MSDC_IRQ_WAIT 1
 #define NATIVE_MSDC_WORKER_EXPERIMENT 1
 #define NATIVE_MSDC_VERIFIED 1
-constexpr int kIODirectionIn=1;
+using IODirection=int;constexpr int kIODirectionIn=1,kIODirectionOut=2;constexpr uint64_t kSector=512;
+bool gIoTimingEnabled=false;uint64_t native_msdc_block_offer_stats[12]{},native_msdc_block_queue_stats[3]{};
+std::atomic<uint64_t> ticks{100};uint64_t mach_absolute_time(){return ticks.fetch_add(100);}void absolutetime_to_nanoseconds(uint64_t t,uint64_t*out){*out=t;}
 struct IOStorageAttributes{unsigned options;};struct IOStorageCompletion{void*target;void(*action)(void*,void*,int,uint64_t);void*parameter;};
-struct IOMemoryDescriptor{int getDirection(){return kIODirectionIn;}uint8_t data[512]{};uint8_t expected=0;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
+struct IOMemoryDescriptor{int direction=kIODirectionIn;int getDirection(){return direction;}uint8_t data[512]{};uint8_t expected=0;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
 struct IOService{std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
 struct NativeMsdcBlock{bool verifiedActive=true,manifestReadOnly=true,writable=false;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}
  int doSynchronizeCache();int synchronizeNow();int readWriteNow(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);
@@ -68,6 +71,14 @@ int NativeMsdcBlock::readWriteNow(IOMemoryDescriptor*buffer,UInt64 block,UInt64,
 int NativeMsdcBlock::synchronizeNow(){if(syncGate){std::unique_lock<std::mutex> l(gateMutex);gateEntered=true;gateCv.wait(l,[]{return gateOpen;});}return 0;}
 void joinWorker(){for(;;){IOLockLock(gBlockQueueLock);bool done=!gBlockRunning;IOLockUnlock(gBlockQueueLock);if(done && gBlockParent->refs==1)break;std::this_thread::yield();}}
 int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IOService parent;IOStorageCompletion c{nullptr,complete,nullptr};
+ if(argc>1 && argv[1][0]=='m'){
+  gIoTimingEnabled=true;assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==0);
+  assert(owner.doAsyncReadWrite(&buffer,0,9,nullptr,&c)==0);assert(owner.doAsyncReadWrite(&buffer,0,129,nullptr,&c)==0);
+  assert(native_msdc_block_offer_stats[0]==1 && native_msdc_block_offer_stats[1]==512);
+  assert(native_msdc_block_offer_stats[2]==1 && native_msdc_block_offer_stats[3]==4608);
+  assert(native_msdc_block_offer_stats[4]==1 && native_msdc_block_offer_stats[5]==66048);
+  buffer.direction=kIODirectionOut;assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==0);
+  assert(native_msdc_block_offer_stats[6]==1 && native_msdc_block_offer_stats[7]==512);return 0;}
  if(argc>1 && argv[1][0]=='p'){
   __atomic_store_n(&gActivationStopped,true,__ATOMIC_RELEASE);stopBlockWorker();assert(!prepareBlockWorker(&parent));
   assert(!startBlockWorker(&parent));assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==kIOReturnNotReady);return 0;}
@@ -82,6 +93,9 @@ int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IO
   failStartAt=argv[1][1]=='0'?0:1;assert(!startBlockWorker(&parent));assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==0);stopBlockWorker();assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==kIOReturnNotReady);while(parent.refs!=1)std::this_thread::yield();return 0;}
  assert(startBlockWorker(&parent));
  assert(!startBlockWorker(&parent));
+ if(argc>1 && argv[1][0]=='v'){
+  gIoTimingEnabled=true;assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==0);while(completed!=1)std::this_thread::yield();
+  stopBlockWorker();joinWorker();assert(native_msdc_block_queue_stats[0]==1 && native_msdc_block_queue_stats[1]>=100 && native_msdc_block_queue_stats[2]>=100);return 0;}
  if(argc>1 && argv[1][0]=='k'){
   blockCreate=true;assert(owner.doAsyncReadWrite(&buffer,888,1,nullptr,&c)==0);while(!gateEntered)std::this_thread::yield();std::atomic<int> result{-1};
   std::thread submit([&]{result=owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c);});while(!createEntered)std::this_thread::yield();stopBlockWorker();
@@ -126,9 +140,9 @@ int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IO
  assert(order.size()==30);for(int i=0;i<30;i++)assert(order[i]==(unsigned)i);assert(owner.refs==1 && buffer.refs==1 && parent.refs==1);assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==kIOReturnNotReady);return 0;}
 '''
 with tempfile.TemporaryDirectory(prefix='msdc-worker-') as d:
- p=Path(d)/'a.cpp';x=Path(d)/'a';p.write_text(pre+queue+sync+asyncfn+post)
+ p=Path(d)/'a.cpp';x=Path(d)/'a';p.write_text(pre+sizebin+queue+sync+asyncfn+post)
  subprocess.run(['c++','-std=c++17','-O2','-Wall','-Wextra','-Werror','-pthread',*shlex.split(os.environ.get('MSDC_TEST_CXXFLAGS','')),str(p),'-o',str(x)],check=True)
- for mode in ('normal','reentry','stop','full','cycle','data','hardware','xstop','ysync','i0','i1','zfail','kstop','qsingle','allocfail','b0','b1','prestop'):
+ for mode in ('normal','reentry','stop','full','cycle','data','hardware','xstop','ysync','i0','i1','zfail','kstop','qsingle','allocfail','b0','b1','prestop','metrics','vqueue'):
   subprocess.run([str(x),mode] if mode!='normal' else [str(x)],check=True,timeout=15)
  print('PASS FIFO/reentry, data snapshots, stop cancellation, full-queue sync and lifetimes')
  print('PASS nested read, returned media credits, saturation polling fallback, and direct I/O stop serialization')
