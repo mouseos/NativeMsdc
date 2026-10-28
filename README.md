@@ -281,3 +281,10 @@ readiness API requires a matching ArmCpu build with release/acquire publication.
 failure, ownership and stop races with host mocks; it does not validate hardware
 IRQ delivery or prove a latency improvement. External SYSIRQ writers that do
 not use the ArmCpu shared lock remain an integration assumption.
+
+The deferred activation lifecycle is still under review. In particular,
+`tests/publisher-stop-host.py` reproduces an in-flight `device->start()` which
+can publish after stop has signalled cancellation; cancellation is cooperative
+and is not a teardown barrier. Worker creation also holds the activation mutex
+while allocating and starting threads. Do not treat these host tests as proof
+that stop is deadlock-free or that teardown prevents all later publication.

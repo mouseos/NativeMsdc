@@ -721,7 +721,7 @@ bool controllerWindow (IOService *provider, uint64_t &phys, uint64_t &length, co
 #if NATIVE_MSDC_IRQ_WAIT
 // Board-specific wiring is passed as ADT metadata. Refuse unexpected shapes
 // or an inherited enabled source; startup and the DMA self-test remain polled.
-void hostEnableIrq (IOService *provider)
+void hostEnableIrq (IOService *provider, HostSession &session)
 {
   OSData *spiData = OSDynamicCast (OSData, provider->getProperty ("msdc-irq-spi"));
   OSData *baseData = OSDynamicCast (OSData, provider->getProperty ("msdc-sysirq-base"));
@@ -742,7 +742,6 @@ void hostEnableIrq (IOService *provider)
            static_cast<unsigned long long> (base));
     return;
   }
-  HostSession session;
   if (session.inheritedInterrupts ()) {
     IOLog ("NativeMsdc: IRQ unavailable inherited enables=0x%x\n", session.inheritedInterrupts ());
     return;
@@ -1656,6 +1655,8 @@ NativeMsdcBlock *gPending[kMaxWindows];
 RootPlan gPlan;
 NativeMsdc *gPendingProvider;
 bool gVerifyWindows;
+// Cooperative cancellation; an already-entered start still needs lifecycle handling.
+bool gPublisherStopped;
 
 // The window's image as flashed must hash to the manifest entry. Reads the whole window.
 bool windowMatchesManifest (NativeMsdcBlock *device)
@@ -1665,6 +1666,7 @@ bool windowMatchesManifest (NativeMsdcBlock *device)
   SHA256_CTX context;
   SHA256_Init (&context);
   for (uint64_t done = 0; done < count;) {
+    if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE)) return false;
     uint32_t blocks = count - done > kMaxBlocks ? kMaxBlocks : uint32_t (count - done);
     HostSession session;
     if (transfer (first + done, blocks, gHost.bounce, false, true) != kIOReturnSuccess) return false;
@@ -1726,6 +1728,7 @@ void publishThread (void *, wait_result_t)
   if (policyFailure) IOLog ("NativeMsdc: signed root policy unusable: %s; no window is published\n", policyFailure);
   unsigned verifiedWindows = 0;
   for (unsigned index = 0; index < gHost.manifest.count; ++index) {
+    if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE)) break;
     NativeMsdcBlock *device = gPending[index];
     if (!device) continue;
     int status = -1;
@@ -1743,6 +1746,7 @@ void publishThread (void *, wait_result_t)
   if (!verifiedWindows) freePolicy ();
 #endif
   for (unsigned position = 0; position < gPlan.count; ++position) {
+    if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE)) break;
     unsigned index = gPlan.order[position];
     NativeMsdcBlock *device = gPending[index];
     if (!device) continue;
@@ -1752,6 +1756,7 @@ void publishThread (void *, wait_result_t)
       discardPending (index);
       continue;
     }
+    if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE)) break;
     if (!device->start (gPendingProvider)) {
       IOLog ("NativeMsdc: %s did not start; not published\n", device->windowLabel ());
       native_msdc_failure = "window start failed";
@@ -1766,10 +1771,13 @@ void publishThread (void *, wait_result_t)
       break;
     }
     bool ready = false;
-    for (unsigned tick = 0; tick < 300 && !(ready = volumeBelow (device)); ++tick) IOSleep (100);
+    for (unsigned tick = 0; tick < 300 && !__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) &&
+         !(ready = volumeBelow (device)); ++tick) IOSleep (100);
     IOLog ("NativeMsdc: %s volume %s\n", device->windowLabel (), ready ? "ready" : "not seen after 30 s");
     device->release ();
   }
+  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE))
+    for (unsigned index = 0; index < gHost.manifest.count; ++index) discardPending (index);
   native_msdc_step = 6;
 #if NATIVE_MSDC_IRQ_WAIT
   __atomic_store_n (&gPublisherThread, static_cast<thread_t> (nullptr), __ATOMIC_RELEASE);
@@ -1806,20 +1814,26 @@ void activateIrq (void *argument, wait_result_t)
     if (armcpu_spi_boot_ready ()) { ready = true; break; }
     IOSleep (100);
   }
-  IOLockLock (gActivationLock);
   if (ready && !__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE)) {
-    // hostEnableIrq holds HostSession while it tests inherited masks and
-    // attaches, so it cannot cross an in-flight polling transfer.
-    hostEnableIrq (activation->provider);
+    {
+      // Take the host before the lifecycle gate. In particular, stop never
+      // waits for the gate while its owner is waiting for this mutex.
+      HostSession session;
+      IOLockLock (gActivationLock);
+      if (!__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE))
+        hostEnableIrq (activation->provider, session);
+      IOLockUnlock (gActivationLock);
+    }
 #if NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_WORKER_EXPERIMENT
-    if (activation->worker && __atomic_load_n (&gHost.irqReady, __ATOMIC_ACQUIRE) &&
-        !startBlockWorker (activation->owner))
+    IOLockLock (gActivationLock);
+    if (!__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE) && activation->worker &&
+        __atomic_load_n (&gHost.irqReady, __ATOMIC_ACQUIRE) && !startBlockWorker (activation->owner))
       IOLog ("NativeMsdc: block worker unavailable; polling\n");
+    IOLockUnlock (gActivationLock);
 #endif
   } else if (!ready && !__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE)) {
     IOLog ("NativeMsdc: GIC readiness timed out; polling\n");
   }
-  IOLockUnlock (gActivationLock);
   activation->provider->release ();
   activation->owner->release ();
   IOFree (activation, sizeof (*activation));
@@ -1938,6 +1952,9 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 
 void NativeMsdc::stop (IOService *provider)
 {
+#if NATIVE_MSDC_BLOCK_DEVICES
+  __atomic_store_n (&gPublisherStopped, true, __ATOMIC_RELEASE);
+#endif
 #if NATIVE_MSDC_IRQ_WAIT
   if (gActivationLock) {
     IOLockLock (gActivationLock);

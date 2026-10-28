@@ -30,7 +30,8 @@ std::atomic<bool> ready{false}, entering{false}, proceed{false};
 std::atomic<int> attaches{0},workers{0},sleeps{0}; bool attachSuccess=true, blockAttach=false;
 bool armcpu_spi_boot_ready(){return ready.load();}
 void IOSleep(unsigned){++sleeps; std::this_thread::sleep_for(1ms);}
-void hostEnableIrq(IOService*){++attaches; entering=true; while(blockAttach && !proceed) std::this_thread::yield(); __atomic_store_n(&gHost.irqReady,attachSuccess,__ATOMIC_RELEASE);}
+std::mutex hostMutex; struct HostSession {HostSession(){hostMutex.lock();} ~HostSession(){hostMutex.unlock();}};
+void hostEnableIrq(IOService*,HostSession&){++attaches; entering=true; while(blockAttach && !proceed) std::this_thread::yield(); __atomic_store_n(&gHost.irqReady,attachSuccess,__ATOMIC_RELEASE);}
 bool startBlockWorker(NativeMsdc*){++workers;return true;}
 void* IOMalloc(size_t n){return malloc(n);} void IOFree(void*p,size_t){free(p);}
 std::vector<std::thread*> threads;
@@ -45,6 +46,7 @@ int main(){NativeMsdc owner;IOService provider;
  reset();scheduleIrqActivation(&owner,&provider,true);while(sleeps<2)std::this_thread::yield();assert(attaches==0&&workers==0);ready=true;join();assert(attaches==1&&workers==1&&owner.refs==1&&provider.refs==1);
  reset();scheduleIrqActivation(&owner,&provider,true);while(sleeps<2)std::this_thread::yield();stop();ready=true;join();assert(attaches==0&&workers==0&&owner.refs==1&&provider.refs==1);
  reset();scheduleIrqActivation(&owner,&provider,true);join();assert(attaches==0&&workers==0&&sleeps==600&&owner.refs==1&&provider.refs==1);
+ reset();ready=true;hostMutex.lock();scheduleIrqActivation(&owner,&provider,true);std::this_thread::sleep_for(3ms);stop();hostMutex.unlock();join();assert(attaches==0&&workers==0&&owner.refs==1&&provider.refs==1);
  reset();ready=true;attachSuccess=false;scheduleIrqActivation(&owner,&provider,true);join();assert(attaches==1&&workers==0);
  reset();ready=true;blockAttach=true;scheduleIrqActivation(&owner,&provider,true);while(!entering)std::this_thread::yield();std::atomic<bool> stopped{false};std::thread stopper([&]{stop();stopped=true;});std::this_thread::sleep_for(3ms);assert(!stopped);proceed=true;stopper.join();join();assert(attaches==1&&workers==1&&stopped&&owner.refs==1&&provider.refs==1);
  reset();ready=true;scheduleIrqActivation(&owner,&provider,false);join();assert(attaches==1&&workers==0);

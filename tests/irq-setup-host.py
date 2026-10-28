@@ -3,7 +3,7 @@
 from pathlib import Path
 import subprocess, tempfile
 s=(Path(__file__).resolve().parents[1]/'NativeMsdc.cpp').read_text()
-start=s.index('void hostEnableIrq (IOService *provider)');end=s.index('\n#endif',start)
+start=s.index('void hostEnableIrq (IOService *provider, HostSession &session)');end=s.index('\n#endif',start)
 body=s[start:end].replace('__asm__ volatile ("dsb sy" ::: "memory");','__atomic_thread_fence (__ATOMIC_SEQ_CST);')
 pre=r'''
 #include <cassert>
@@ -29,15 +29,15 @@ IOReturn armcpu_spi_attach_sysirq(uint32_t spi,volatile uint32_t *pol,void(*)(vo
 #define IOLog(...) do {} while(0)
 '''
 post=r'''
-int main(){uint32_t spi=78,low=1;uint64_t base=0x10200620;
+int main(){HostSession session;uint32_t spi=78,low=1;uint64_t base=0x10200620;
  OSData a{4,&spi},b{8,&base},c{4,&low};IOService provider{&a,&b,&c};
- inherited=1;hostEnableIrq(&provider);assert(attaches==0);
- inherited=0;low=0;hostEnableIrq(&provider);assert(attaches==0);low=1;
- failMap=true;hostEnableIrq(&provider);assert(!gHost.irqLock && !gHost.sysirqMap);failMap=false;
+ inherited=1;hostEnableIrq(&provider,session);assert(attaches==0);
+ inherited=0;low=0;hostEnableIrq(&provider,session);assert(attaches==0);low=1;
+ failMap=true;hostEnableIrq(&provider,session);assert(!gHost.irqLock && !gHost.sysirqMap);failMap=false;
  unsigned idx=(0x620+8)/4;uint32_t bit=1u<<14;regs[idx]=0x100;attachResult=1;
- hostEnableIrq(&provider);assert(attaches==1 && regs[idx]==0x100 && !gHost.irqLock);
- attachResult=2;hostEnableIrq(&provider);assert(!gHost.irqReady && gHost.irqLock && !(regs[idx]&bit));
- gHost={};gHost.dmaEnabled=true;attachResult=0;attachReadback=0xa003;hostEnableIrq(&provider);assert(gHost.irqReady && (regs[idx]&bit));
+ hostEnableIrq(&provider,session);assert(attaches==1 && regs[idx]==0x100 && !gHost.irqLock);
+ attachResult=2;hostEnableIrq(&provider,session);assert(!gHost.irqReady && gHost.irqLock && !(regs[idx]&bit));
+ gHost={};gHost.dmaEnabled=true;attachResult=0;attachReadback=0xa003;hostEnableIrq(&provider,session);assert(gHost.irqReady && (regs[idx]&bit));
  puts("PASS actual IRQ setup: metadata, inherited mask, map failure, rollback, readback refusal, valid GIC target");}
 '''
 with tempfile.TemporaryDirectory(prefix='msdc-setup-') as d:
