@@ -34,7 +34,7 @@ struct IOService{std::atomic<int> refs{1};void retain(){refs++;}void release(){r
 struct NativeMsdcBlock{bool verifiedActive=true,manifestReadOnly=true,writable=false;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}
  int doSynchronizeCache();int synchronizeNow();int readWriteNow(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);
  int doAsyncReadWrite(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);};
-struct {bool irqReady=true;} gHost;thread_t gIoWorkerThread=nullptr;uint64_t native_msdc_worker_stats[4]{};
+bool gActivationStopped=false;struct {bool irqReady=true;} gHost;thread_t gIoWorkerThread=nullptr;uint64_t native_msdc_worker_stats[4]{};
 thread_local int ident;thread_t current_thread(){return &ident;}
 using thread_call_param_t=void*;struct Call{void(*fn)(void*,void*);void*arg;};using thread_call_t=Call*;
 constexpr int THREAD_CALL_PRIORITY_KERNEL=1;bool failCall=false;
@@ -46,8 +46,8 @@ IOLock* IOLockAlloc(){return new IOLock;}void IOLockFree(IOLock*p){delete p;}
 void IOLockLock(IOLock*p){p->m.lock();}void IOLockUnlock(IOLock*p){p->m.unlock();}
 int IOLockSleep(IOLock*p,void*event,int){auto &c=p->events[event];if(!c)c=std::make_shared<std::condition_variable>();std::unique_lock<std::mutex> l(p->m,std::adopt_lock);c->wait(l);l.release();return 0;}
 void IOLockWakeup(IOLock*p,void*event,bool){auto it=p->events.find(event);if(it!=p->events.end())it->second->notify_all();}
-std::atomic<int> startCount{0};int failStartAt=-1;std::atomic<bool> createEntered{false};bool blockCreate=false,createOpen=false;std::mutex createMutex;std::condition_variable createCv;
-int kernel_thread_start(void(*fn)(void*,int),void *arg,thread_t *out){int n=startCount.fetch_add(1);if(n==failStartAt)return 1;if(blockCreate && n==2){std::unique_lock<std::mutex> l(createMutex);createEntered=true;createCv.wait(l,[]{return createOpen;});}std::thread([=]{fn(arg,0);}).detach();*out=reinterpret_cast<void*>(1);return 0;}
+std::atomic<int> startCount{0};int failStartAt=-1;std::atomic<bool> createEntered{false};bool blockCreate=false,createOpen=false;int blockAt=2;std::mutex createMutex;std::condition_variable createCv;
+int kernel_thread_start(void(*fn)(void*,int),void *arg,thread_t *out){int n=startCount.fetch_add(1);if(n==failStartAt)return 1;if(blockCreate && n==blockAt){std::unique_lock<std::mutex> l(createMutex);createEntered=true;createCv.wait(l,[]{return createOpen;});}std::thread([=]{fn(arg,0);}).detach();*out=reinterpret_cast<void*>(1);return 0;}
 void thread_deallocate(thread_t){}bool failAlloc=false;void* IOMalloc(size_t n){return failAlloc?nullptr:malloc(n);}void IOFree(void*p,size_t){free(p);}
 '''
 post=r'''
@@ -68,9 +68,20 @@ int NativeMsdcBlock::readWriteNow(IOMemoryDescriptor*buffer,UInt64 block,UInt64,
 int NativeMsdcBlock::synchronizeNow(){if(syncGate){std::unique_lock<std::mutex> l(gateMutex);gateEntered=true;gateCv.wait(l,[]{return gateOpen;});}return 0;}
 void joinWorker(){for(;;){IOLockLock(gBlockQueueLock);bool done=!gBlockRunning;IOLockUnlock(gBlockQueueLock);if(done && gBlockParent->refs==1)break;std::this_thread::yield();}}
 int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IOService parent;IOStorageCompletion c{nullptr,complete,nullptr};
+ if(argc>1 && argv[1][0]=='p'){
+  __atomic_store_n(&gActivationStopped,true,__ATOMIC_RELEASE);stopBlockWorker();assert(!prepareBlockWorker(&parent));
+  assert(!startBlockWorker(&parent));assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==kIOReturnNotReady);return 0;}
+ assert(prepareBlockWorker(&parent));
+ if(argc>1 && argv[1][0]=='b'){
+  blockCreate=true;blockAt=argv[1][1]-'0';std::atomic<bool> result{true};
+  std::thread launching([&]{result=startBlockWorker(&parent);});while(!createEntered)std::this_thread::yield();
+  __atomic_store_n(&gActivationStopped,true,__ATOMIC_RELEASE);stopBlockWorker();assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==kIOReturnNotReady);
+  {std::lock_guard<std::mutex> l(createMutex);createOpen=true;}createCv.notify_all();launching.join();
+  while(parent.refs!=1){std::this_thread::yield();} assert(!result && !gBlockPoolReady && completed==0);return 0;}
  if(argc>1 && argv[1][0]=='i'){
   failStartAt=argv[1][1]=='0'?0:1;assert(!startBlockWorker(&parent));assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==0);stopBlockWorker();assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==kIOReturnNotReady);while(parent.refs!=1)std::this_thread::yield();return 0;}
  assert(startBlockWorker(&parent));
+ assert(!startBlockWorker(&parent));
  if(argc>1 && argv[1][0]=='k'){
   blockCreate=true;assert(owner.doAsyncReadWrite(&buffer,888,1,nullptr,&c)==0);while(!gateEntered)std::this_thread::yield();std::atomic<int> result{-1};
   std::thread submit([&]{result=owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c);});while(!createEntered)std::this_thread::yield();stopBlockWorker();
@@ -117,7 +128,7 @@ int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IO
 with tempfile.TemporaryDirectory(prefix='msdc-worker-') as d:
  p=Path(d)/'a.cpp';x=Path(d)/'a';p.write_text(pre+queue+sync+asyncfn+post)
  subprocess.run(['c++','-std=c++17','-O2','-Wall','-Wextra','-Werror','-pthread',*shlex.split(os.environ.get('MSDC_TEST_CXXFLAGS','')),str(p),'-o',str(x)],check=True)
- for mode in ('normal','reentry','stop','full','cycle','data','hardware','xstop','ysync','i0','i1','zfail','kstop','qsingle','allocfail'):
+ for mode in ('normal','reentry','stop','full','cycle','data','hardware','xstop','ysync','i0','i1','zfail','kstop','qsingle','allocfail','b0','b1','prestop'):
   subprocess.run([str(x),mode] if mode!='normal' else [str(x)],check=True,timeout=15)
  print('PASS FIFO/reentry, data snapshots, stop cancellation, full-queue sync and lifetimes')
  print('PASS nested read, returned media credits, saturation polling fallback, and direct I/O stop serialization')

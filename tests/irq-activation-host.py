@@ -3,7 +3,7 @@
 from pathlib import Path
 import subprocess, tempfile
 s = (Path(__file__).resolve().parents[1] / 'NativeMsdc.cpp').read_text()
-a = s.index('IOLock *gActivationLock = nullptr;')
+a = s.index('struct IrqActivation {')
 b = s.index('\n}\n#endif\n\nbool NativeMsdc::start', a)
 body = s[a:b]
 pre = r'''
@@ -16,12 +16,13 @@ pre = r'''
 #include <thread>
 #include <vector>
 using namespace std::chrono_literals;
+bool gActivationStopped=false;
 using wait_result_t=int; using thread_t=std::thread*;
 constexpr int KERN_SUCCESS=0;
 #define NATIVE_MSDC_BLOCK_DEVICES 1
 #define NATIVE_MSDC_WORKER_EXPERIMENT 1
 #define IOLog(...) do {} while(0)
-struct IOLock { std::mutex mutex; } lifecycle;
+struct IOLock { std::mutex mutex; } lifecycle; IOLock *gActivationLock=nullptr;
 void IOLockLock(IOLock*l){l->mutex.lock();} void IOLockUnlock(IOLock*l){l->mutex.unlock();}
 struct IOService {std::atomic<int> refs{1}; void retain(){++refs;} void release(){--refs;}};
 struct NativeMsdc:IOService{};
@@ -31,7 +32,7 @@ std::atomic<int> attaches{0},workers{0},sleeps{0}; bool attachSuccess=true, bloc
 bool armcpu_spi_boot_ready(){return ready.load();}
 void IOSleep(unsigned){++sleeps; std::this_thread::sleep_for(1ms);}
 std::mutex hostMutex; struct HostSession {HostSession(){hostMutex.lock();} ~HostSession(){hostMutex.unlock();}};
-void hostEnableIrq(IOService*,HostSession&){++attaches; entering=true; while(blockAttach && !proceed) std::this_thread::yield(); __atomic_store_n(&gHost.irqReady,attachSuccess,__ATOMIC_RELEASE);}
+void hostEnableIrq(IOService*,HostSession&){IOLockLock(gActivationLock);if(!__atomic_load_n(&gActivationStopped,__ATOMIC_ACQUIRE)){++attaches; entering=true; while(blockAttach && !proceed) std::this_thread::yield(); __atomic_store_n(&gHost.irqReady,attachSuccess,__ATOMIC_RELEASE);} IOLockUnlock(gActivationLock);}
 bool startBlockWorker(NativeMsdc*){++workers;return true;}
 void* IOMalloc(size_t n){return malloc(n);} void IOFree(void*p,size_t){free(p);}
 std::vector<std::thread*> threads;

@@ -24,6 +24,7 @@ struct IOSimpleLock{} lock;
 IOSimpleLock* IOSimpleLockAlloc(){return failLock?nullptr:&lock;}void IOSimpleLockFree(IOSimpleLock*){}
 struct Host {bool dmaEnabled=true,irqReady=false;uint32_t irqSpi=0;volatile uint32_t irqFault=0;IOSimpleLock*irqLock=nullptr;IOMemoryMap*sysirqMap=nullptr;} gHost;
 uint32_t inherited=0;struct HostSession {uint32_t inheritedInterrupts(){return inherited;}};
+struct IOLock{} gate; IOLock *gActivationLock=&gate; bool gActivationStopped=false; void IOLockLock(IOLock*){} void IOLockUnlock(IOLock*){}
 void dmaIrq(void*){}
 IOReturn armcpu_spi_attach_sysirq(uint32_t spi,volatile uint32_t *pol,void(*)(void*),void*,uint32_t*readback,uint64_t*target,bool*installed){assert(spi==78);++attaches;*readback=attachReadback;*target=attachTarget;*installed=attachResult==2;if(!attachResult){*pol|=1u<<14;*installed=true;}return attachResult;}
 #define IOLog(...) do {} while(0)

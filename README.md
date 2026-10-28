@@ -274,7 +274,7 @@ Until activation, publication and block requests retain the polled path. Once
 ready it makes exactly one registration attempt under the host mutex; rejected
 metadata, inherited interrupts, allocation failure, or any attach failure is
 terminal for this boot. A lifecycle mutex serializes registration and worker
-creation with stop. The publisher still starts independently, and the worker
+admission with stop. The publisher still starts independently, and the worker
 is started only for a valid root with successful IRQ registration. The GIC
 readiness API requires a matching ArmCpu build with release/acquire publication.
 `python3 tests/irq-activation-host.py` covers delayed readiness, terminal
@@ -285,6 +285,6 @@ not use the ArmCpu shared lock remain an integration assumption.
 The deferred activation lifecycle is still under review. In particular,
 `tests/publisher-stop-host.py` reproduces an in-flight `device->start()` which
 can publish after stop has signalled cancellation; cancellation is cooperative
-and is not a teardown barrier. Worker creation also holds the activation mutex
-while allocating and starting threads. Do not treat these host tests as proof
-that stop is deadlock-free or that teardown prevents all later publication.
+and is not a teardown barrier. Worker thread creation is performed outside the activation mutex, with
+admission closed by stop and in-flight creation retaining the provider. Do not
+treat these host tests as proof that teardown prevents all later publication.
