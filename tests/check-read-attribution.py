@@ -119,6 +119,8 @@ assert 'IOLog' not in hook and 'retain' not in hook and 'mach_absolute_time' not
 entry=s[s.index('IOReturn NativeMsdcBlock::doAsyncReadWrite'):s.index('IOReturn NativeMsdcBlock::readWriteNow')]
 assert entry.index('recordAttributedBlockRead')<entry.index('BlockJob *job')
 assert 'bootArgument("native-msdc-attribution", 1, 0) == 1' in s
+assert 'bootArgument("native-msdc-attrib", 1, 0) == 1' in s
+assert len('native-msdc-attrib=1')==len('native-msdc-iostat=1')==20
 print('PASS actual pre-worker KPI hook, default-off, null/all attributes, extent/write refusal, store split, lifecycle failure/owner stop, fixed table contention/overflow accounting; ASan/UBSan')
 
 start=s[s.index('bool NativeMsdc::start (IOService *provider)'):s.index('bool NativeMsdc::startRoot (')]

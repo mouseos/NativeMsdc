@@ -2194,7 +2194,9 @@ bool NativeMsdc::start (IOService *provider)
 #endif
 #endif
   // No failure return remains after the reporter takes its service reference.
-  startReadAttribution(this, bootArgument("native-msdc-attribution", 1, 0) == 1);
+  const bool attributeReads = bootArgument("native-msdc-attribution", 1, 0) == 1 ||
+                              bootArgument("native-msdc-attrib", 1, 0) == 1;
+  startReadAttribution(this, attributeReads);
   if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) && gHost.manifestValid)
     for (unsigned index = 0; index < gHost.manifest.count; ++index)
       IOLog("NativeMsdc attr window index=%u name=%.*s\n", index, int(sizeof(gHost.manifest.window[index].name)), gHost.manifest.window[index].name);

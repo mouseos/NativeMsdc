@@ -342,7 +342,7 @@ latency. Tests: `python3 tests/irq-fallback-host.py` and
 
 ### Optional read-submission attribution
 
-`native-msdc-attribution=1` (exactly 1, default off) enables a resident,
+`native-msdc-attribution=1` (or the compact `native-msdc-attrib=1`; exactly 1, default off) enables a resident,
 one-shot diagnostic reporter after `NativeMsdc::start` has passed all failure
 returns. It retains the service until it exits. Stop is monotonic, disables
 recording, and the reporter exits after at most its next ten-second sleep;
@@ -418,3 +418,10 @@ For VerifiedRoot CPU cost, the existing independent `native-root-timing=1`
 selector enables read/vr_verify_block wall counters even without a new XNU
 ROOT_TIMING build. Preserve that distinction from eager native4k signature
 preparation timing, which requires XNU_ROOT_TIMING compiled into BSD.
+
+The compact selector is20 characters, exactly the same length as
+`native-msdc-iostat=1`. A profile at the1023-byte limit can replace that
+diagnostic selector without deleting functional boot arguments. That switches
+away from iostat/CPU-load fallback reporting and is a diagnostic-profile change,
+not a strict single-variable performance comparison. No automatic replacement
+or boot image editing is performed by the driver.
