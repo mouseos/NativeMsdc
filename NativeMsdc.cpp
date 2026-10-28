@@ -639,6 +639,31 @@ unsigned bootArgument (const char *name, unsigned maximum, unsigned fallback)
   return value;
 }
 
+// Scan whole ASCII tokens: numeric boot-arg conversion truncates wide values
+// and treats a bare name as true. Neither constitutes the exact opt-in '=1'.
+static int verifiedCacheToken (const char *args, const char *name)
+{
+  const size_t size = strlen (name);
+  if (!args) return -1;
+  while (*args) {
+    while (*args == ' ' || *args == '\t' || *args == '\n' || *args == '\r') ++args;
+    const char *end = args;
+    while (*end && *end != ' ' && *end != '\t' && *end != '\n' && *end != '\r') ++end;
+    const size_t length = size_t (end - args);
+    if (length >= size && !strncmp (args, name, size) && (length == size || args[size] == '='))
+      return length == size + 2 && args[size] == '=' && args[size + 1] == '1' ? 1 : 0;
+    args = end;
+  }
+  return -1;
+}
+bool verifiedCacheArgument ()
+{
+  const char *args = PE_boot_args ();
+  const int full = verifiedCacheToken (args, "native-msdc-vcache");
+  return (full >= 0 ? full : verifiedCacheToken (args, "mcv")) == 1;
+}
+
+
 void fail (const char *why)
 {
   native_msdc_failure = why;
@@ -1626,7 +1651,7 @@ const char *NativeMsdcBlock::configureVerification (int *status)
   verified = view;
   envelope = region + entry.offset;
   writable = false;
-  verifiedCacheEnabled = bootArgument ("native-msdc-vcache", 1, 0) == 1;
+  verifiedCacheEnabled = verifiedCacheArgument ();
   verifiedCache.metrics = native_msdc_verified_cache_stats;
   verifiedActive = true;
   return nullptr;
