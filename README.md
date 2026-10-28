@@ -282,18 +282,19 @@ failure, ownership and stop races with host mocks; it does not validate hardware
 IRQ delivery or prove a latency improvement. External SYSIRQ writers that do
 not use the ArmCpu shared lock remain an integration assumption.
 
-The deferred activation lifecycle is still under review. In particular,
-`tests/publisher-stop-host.py` reproduces an in-flight `device->start()` which
-can publish after stop has signalled cancellation; cancellation is cooperative
-and is not a teardown barrier. Worker thread creation is performed outside the activation mutex, with
-admission closed by stop and in-flight creation retaining the provider. Do not
-treat these host tests as proof that teardown prevents all later publication.
-
-Child start now checks cancellation and IOKit inactive state both before and
-after the base start; a cancelled policy read also stops at its next transfer
-boundary. XNU termination phase 1 marks attached descendants inactive, and
-`IOService::startMatching` rejects inactive services under arbitration. These
-checks do not serialize a direct `stop()` against an already-entered
-`registerService()`. `python3 tests/publisher-child-start-host.py` exercises the
-actual child start and reproduces that remaining race with a blocked mock of
-registration. This is not a replacement for the actual IOKit lifecycle test.
+The publisher has an independently retained cleanup thread, started before
+publication is admitted. Stop signals that thread without waiting for it. It
+calls `terminate(kIOServiceRequired)` on the parent, retrying
+termination failure until the parent is inactive. XNU termination recursively
+makes attached single-provider children inactive; its `startMatching` checks
+inactive under arbitration. A publication already committed before stop may
+briefly match until this asynchronous teardown takes effect; stop returning is
+not a synchronous teardown barrier. This assumes termination eventually succeeds
+and that the child remains a single-provider client of this parent. The host
+lifecycle model exercises an in-flight registration, retry, startup ordering,
+abort, wake-before-wait and retained lifetimes; actual IOKit teardown and
+hardware execution remain unverified. `python3 tests/publisher-terminate-host.py`
+uses the real driver functions with mocked IOKit state, not the XNU workloop.
+The narrower `publisher-child-start-host.py` and `publisher-stop-host.py` tests
+still reproduce the race without the cleanup thread and are not whole-driver
+tests.

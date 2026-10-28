@@ -57,6 +57,7 @@
 #include <libkern/libkern.h>
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/sched_prim.h>
 #ifndef NATIVE_MSDC_IRQ_WAIT
 #define NATIVE_MSDC_IRQ_WAIT 0
 #endif
@@ -67,7 +68,6 @@
 #error "The experimental read worker requires IRQ wait, block devices and verified root"
 #endif
 #if NATIVE_MSDC_IRQ_WAIT
-#include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 extern "C" int get_preemption_level (void);
 extern "C" bool armcpu_spi_boot_ready (void);
@@ -161,6 +161,8 @@ struct MsdcHost {
 MsdcHost gHost;
 #if NATIVE_MSDC_BLOCK_DEVICES
 bool gPublisherStopped = false;
+// 0 waiting, 1 stop requested, 2 publisher could not be started.
+uint32_t gPublisherCleanup = 0;
 #endif
 #if NATIVE_MSDC_IRQ_WAIT
 bool gActivationStopped = false;
@@ -1766,6 +1768,31 @@ void discardPending (unsigned index)
   }
 }
 
+// Stop can run on IOKit's termination workloop with upper locks held. Keep
+// this retained thread asleep until then and let it make the provider inactive
+// off that workloop. IOKit recursively makes attached children inactive, and
+// startMatching refuses inactive children under the arbitration lock.
+void publisherCleanupThread (void *argument, wait_result_t)
+{
+  NativeMsdc *owner = static_cast<NativeMsdc *> (argument);
+  uint32_t action;
+  while (!(action = __atomic_load_n (&gPublisherCleanup, __ATOMIC_ACQUIRE))) {
+    wait_result_t pending = assert_wait (reinterpret_cast<event_t> (&gPublisherCleanup), THREAD_UNINT);
+    action = __atomic_load_n (&gPublisherCleanup, __ATOMIC_ACQUIRE);
+    if (pending == THREAD_WAITING) {
+      if (action) (void) clear_wait (current_thread (), THREAD_AWAKENED);
+      else (void) thread_block (THREAD_CONTINUE_NULL);
+    }
+  }
+  if (action == 1) {
+    while (!owner->isInactive () && !owner->terminate (kIOServiceRequired)) {
+      IOLog ("NativeMsdc: publisher termination failed; retrying\n");
+      IOSleep (250);
+    }
+  }
+  owner->release ();
+}
+
 // Ordered publication: each window before OS waits (up to 30 s) until its APFS volume appears, so SystemOS is
 // resolvable when the root mounts. A window that fails its hash or its start is not published; the rest continue.
 void publishThread (void *, wait_result_t)
@@ -1991,10 +2018,24 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
       return false;
     }
   }
+  // Start cleanup before admitting asynchronous publication; if allocation
+  // fails no child is published and no teardown thread is needed.
   retain ();
   thread_t thread = nullptr;
+  if (kernel_thread_start (publisherCleanupThread, this, &thread) != KERN_SUCCESS) {
+    release ();
+    for (unsigned index = gHost.manifest.count; index;) discardPending (--index);
+    *why = "publisher cleanup thread";
+    return false;
+  }
+  thread_deallocate (thread);
+  retain ();
+  thread = nullptr;
   if (kernel_thread_start (publishThread, nullptr, &thread) != KERN_SUCCESS) {
     release ();
+    uint32_t waiting = 0;
+    (void) __atomic_compare_exchange_n (&gPublisherCleanup, &waiting, 2, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    thread_wakeup (reinterpret_cast<event_t> (&gPublisherCleanup));
     for (unsigned index = gHost.manifest.count; index;) discardPending (--index);
     *why = "publisher thread";
     return false;
@@ -2009,6 +2050,8 @@ void NativeMsdc::stop (IOService *provider)
 {
 #if NATIVE_MSDC_BLOCK_DEVICES
   __atomic_store_n (&gPublisherStopped, true, __ATOMIC_RELEASE);
+  __atomic_store_n (&gPublisherCleanup, 1, __ATOMIC_RELEASE);
+  thread_wakeup (reinterpret_cast<event_t> (&gPublisherCleanup));
 #endif
 #if NATIVE_MSDC_IRQ_WAIT
   __atomic_store_n (&gActivationStopped, true, __ATOMIC_RELEASE);
