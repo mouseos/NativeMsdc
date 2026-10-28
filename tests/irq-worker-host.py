@@ -91,10 +91,11 @@ int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IO
   while(parent.refs!=1){std::this_thread::yield();} assert(!result && !gBlockPoolReady && completed==0);return 0;}
  if(argc>1 && argv[1][0]=='i'){
   failStartAt=argv[1][1]=='0'?0:1;assert(!startBlockWorker(&parent));assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==0);stopBlockWorker();assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==kIOReturnNotReady);while(parent.refs!=1)std::this_thread::yield();return 0;}
+ if(argc>1 && argv[1][0]=='v')gIoTimingEnabled=true;
  assert(startBlockWorker(&parent));
  assert(!startBlockWorker(&parent));
  if(argc>1 && argv[1][0]=='v'){
-  gIoTimingEnabled=true;assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==0);while(completed!=1)std::this_thread::yield();
+  assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==0);while(completed!=1)std::this_thread::yield();
   stopBlockWorker();joinWorker();assert(native_msdc_block_queue_stats[0]==1 && native_msdc_block_queue_stats[1]>=100 && native_msdc_block_queue_stats[2]>=100);return 0;}
  if(argc>1 && argv[1][0]=='k'){
   blockCreate=true;assert(owner.doAsyncReadWrite(&buffer,888,1,nullptr,&c)==0);while(!gateEntered)std::this_thread::yield();std::atomic<int> result{-1};
