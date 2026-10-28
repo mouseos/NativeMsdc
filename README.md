@@ -288,3 +288,12 @@ can publish after stop has signalled cancellation; cancellation is cooperative
 and is not a teardown barrier. Worker thread creation is performed outside the activation mutex, with
 admission closed by stop and in-flight creation retaining the provider. Do not
 treat these host tests as proof that teardown prevents all later publication.
+
+Child start now checks cancellation and IOKit inactive state both before and
+after the base start; a cancelled policy read also stops at its next transfer
+boundary. XNU termination phase 1 marks attached descendants inactive, and
+`IOService::startMatching` rejects inactive services under arbitration. These
+checks do not serialize a direct `stop()` against an already-entered
+`registerService()`. `python3 tests/publisher-child-start-host.py` exercises the
+actual child start and reproduces that remaining race with a blocked mock of
+registration. This is not a replacement for the actual IOKit lifecycle test.

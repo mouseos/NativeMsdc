@@ -159,6 +159,9 @@ struct MsdcHost {
   bool manifestValid;
 };
 MsdcHost gHost;
+#if NATIVE_MSDC_BLOCK_DEVICES
+bool gPublisherStopped = false;
+#endif
 #if NATIVE_MSDC_IRQ_WAIT
 bool gActivationStopped = false;
 IOLock *gActivationLock = nullptr;
@@ -1013,6 +1016,12 @@ const char *loadPolicy (void)
   uint64_t began = mach_absolute_time ();
   uint64_t sectors = (header.totalBytes + kSector - 1) / kSector;
   for (uint64_t done = 0; done < sectors;) {
+#if NATIVE_MSDC_BLOCK_DEVICES
+    if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE)) {
+      freePolicy ();
+      return "policy read cancelled";
+    }
+#endif
     uint32_t blocks = sectors - done > kMaxBlocks ? kMaxBlocks : uint32_t (sectors - done);
     HostSession session;
     if (transfer (firstSector + done, blocks, region + done * kSector, false, true) != kIOReturnSuccess) {
@@ -1364,7 +1373,12 @@ bool NativeMsdcBlock::configure (unsigned index, const RootWindow &entry, uint64
 
 bool NativeMsdcBlock::start (IOService *provider)
 {
+  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || isInactive ()) return false;
   if (!IOBlockStorageDevice::start (provider)) return false;
+  // The provider and its attached children become inactive in termination
+  // phase 1. startMatching also rejects an inactive service under IOKit's
+  // arbitration lock, even if termination races this check.
+  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || isInactive ()) return false;
   online = true;
   registerService ();
   return true;
@@ -1695,8 +1709,6 @@ NativeMsdcBlock *gPending[kMaxWindows];
 RootPlan gPlan;
 NativeMsdc *gPendingProvider;
 bool gVerifyWindows;
-// Cooperative cancellation; an already-entered start still needs lifecycle handling.
-bool gPublisherStopped;
 
 // The window's image as flashed must hash to the manifest entry. Reads the whole window.
 bool windowMatchesManifest (NativeMsdcBlock *device)
