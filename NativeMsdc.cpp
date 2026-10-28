@@ -726,19 +726,32 @@ void hostEnableIrq (IOService *provider)
   OSData *baseData = OSDynamicCast (OSData, provider->getProperty ("msdc-sysirq-base"));
   OSData *lowData = OSDynamicCast (OSData, provider->getProperty ("msdc-irq-low"));
   if (!spiData || spiData->getLength () != 4 || !baseData || baseData->getLength () != 8 ||
-      !lowData || lowData->getLength () != 4 || !gHost.dmaEnabled) return;
+      !lowData || lowData->getLength () != 4 || !gHost.dmaEnabled) {
+    IOLog ("NativeMsdc: IRQ unavailable metadata spi=%u base=%u low=%u dma=%u\n",
+           spiData ? spiData->getLength () : 0, baseData ? baseData->getLength () : 0,
+           lowData ? lowData->getLength () : 0, gHost.dmaEnabled);
+    return;
+  }
   uint32_t spi = 0, low = 0; uint64_t base = 0;
   memcpy (&spi, spiData->getBytesNoCopy (), 4);
   memcpy (&base, baseData->getBytesNoCopy (), 8);
   memcpy (&low, lowData->getBytesNoCopy (), 4);
-  if (spi >= 256 || low != 1 || !base || (base & 3) || (base & 4095) + 32 > 4096) return;
+  if (spi >= 256 || low != 1 || !base || (base & 3) || (base & 4095) + 32 > 4096) {
+    IOLog ("NativeMsdc: IRQ unavailable invalid wiring spi=%u low=%u base=0x%llx\n", spi, low, base);
+    return;
+  }
   HostSession session;
-  if (session.inheritedInterrupts ()) return;
+  if (session.inheritedInterrupts ()) {
+    IOLog ("NativeMsdc: IRQ unavailable inherited enables=0x%x\n", session.inheritedInterrupts ());
+    return;
+  }
   gHost.irqLock = IOSimpleLockAlloc ();
   IODeviceMemory *memory = IODeviceMemory::withRange (base & ~uint64_t (4095), 4096);
   gHost.sysirqMap = memory ? memory->map (kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
   OSSafeReleaseNULL (memory);
   if (!gHost.irqLock || !gHost.sysirqMap) {
+    IOLog ("NativeMsdc: IRQ unavailable allocation lock=%u mapping=%u\n", gHost.irqLock != nullptr,
+           gHost.sysirqMap != nullptr);
     if (gHost.irqLock) IOSimpleLockFree (gHost.irqLock);
     gHost.irqLock = nullptr;
     OSSafeReleaseNULL (gHost.sysirqMap);
@@ -750,6 +763,8 @@ void hostEnableIrq (IOService *provider)
   uint32_t readback = 0; uint64_t target = 0; bool installed = false;
   IOReturn status = armcpu_spi_attach_sysirq (spi, polarity, dmaIrq, nullptr, &readback, &target, &installed);
   if (status != kIOReturnSuccess && !installed) {
+    IOLog ("NativeMsdc: IRQ unavailable attach status=0x%x spi=%u gic=0x%x target=0x%llx\n",
+           status, spi, readback, target);
     IOSimpleLockFree (gHost.irqLock); gHost.irqLock = nullptr;
     OSSafeReleaseNULL (gHost.sysirqMap);
     return;
