@@ -297,9 +297,11 @@ permanent failure, startup ordering,
 abort, wake-before-wait and retained lifetimes; actual IOKit teardown and
 hardware execution remain unverified. `python3 tests/publisher-terminate-host.py`
 uses the real driver functions with mocked IOKit state, not the XNU workloop.
-The narrower `publisher-child-start-host.py` and `publisher-stop-host.py` tests
-still reproduce the race without the cleanup thread and are not whole-driver
-tests.
+When stop races an already-entered child start, the publisher also attempts
+to terminate that child after start returns; this runs off the stop caller.
+`publisher-stop-host.py` tests this retirement and bounded failure using the
+actual publisher function. `publisher-child-start-host.py` still reproduces
+the registration race in isolation. None is a full IOKit workloop test.
 
 The activation/stop lock order is host mutex, activation mutex, then ArmCpu's
 SPI spin lock for attachment; stop sets its cancellation flag first and then

@@ -10,9 +10,9 @@ pre=r'''
 #include <cstdio>
 #include <atomic>
 #include <thread>
-bool gPublisherStopped=false, deactivateOnBase=false, cancelOnBase=false, baseOk=true; int registers=0;
+bool gPublisherStopped=false, deactivateOnBase=false, cancelOnBase=false, baseOk=true; int registers=0, baseStops=0;
 struct IOService{bool inactive=false;bool isInactive(){return inactive;}};
-struct IOBlockStorageDevice{bool inactive=false; bool isInactive(){return inactive;} bool start(IOService*){if(deactivateOnBase)inactive=true;if(cancelOnBase)__atomic_store_n(&gPublisherStopped,true,__ATOMIC_RELEASE);return baseOk;}};
+struct IOBlockStorageDevice{void stop(IOService*){++baseStops;} bool inactive=false; bool isInactive(){return inactive;} bool start(IOService*){if(deactivateOnBase)inactive=true;if(cancelOnBase)__atomic_store_n(&gPublisherStopped,true,__ATOMIC_RELEASE);return baseOk;}};
 std::atomic<bool> entered{false},go{false};bool blockRegister=false;
 struct NativeMsdcBlock:IOBlockStorageDevice {bool online=false;bool start(IOService*);void registerService(){entered=true;while(blockRegister && !go)std::this_thread::yield();++registers;}};
 '''
@@ -20,8 +20,8 @@ post=r'''
 int main(){IOService provider;NativeMsdcBlock a;gPublisherStopped=true;assert(!a.start(&provider)&&!a.online&&!registers);
  gPublisherStopped=false;provider.inactive=true;NativeMsdcBlock blockedParent;assert(!blockedParent.start(&provider)&&!registers);provider.inactive=false;
  NativeMsdcBlock b; b.inactive=true;assert(!b.start(&provider)&&!registers);
- NativeMsdcBlock c;deactivateOnBase=true;assert(!c.start(&provider)&&!c.online&&!registers);deactivateOnBase=false;
- NativeMsdcBlock d;cancelOnBase=true;assert(!d.start(&provider)&&!d.online&&!registers);cancelOnBase=false;gPublisherStopped=false;
+ NativeMsdcBlock c;deactivateOnBase=true;assert(!c.start(&provider)&&!c.online&&!registers&&baseStops==1);deactivateOnBase=false;
+ NativeMsdcBlock d;cancelOnBase=true;assert(!d.start(&provider)&&!d.online&&!registers&&baseStops==2);cancelOnBase=false;gPublisherStopped=false;
  NativeMsdcBlock e;assert(e.start(&provider)&&e.online&&registers==1);
  NativeMsdcBlock f;blockRegister=true;entered=false;std::thread t([&]{assert(f.start(&provider));});
  while(!entered){std::this_thread::yield();}__atomic_store_n(&gPublisherStopped,true,__ATOMIC_RELEASE);go=true;t.join();

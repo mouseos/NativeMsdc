@@ -14,11 +14,11 @@ using wait_result_t=int;using thread_t=int;
 #define NATIVE_MSDC_IRQ_WAIT 0
 #define NATIVE_MSDC_VERIFIED 0
 #define IOLog(...) do {} while(0)
-bool gPublisherStopped=false,gVerifyWindows=false;unsigned native_msdc_blocks_published=0,native_msdc_step=0;
+bool gPublisherStopped=false,gVerifyWindows=false;unsigned native_msdc_blocks_published=0,native_msdc_step=0,native_msdc_publisher_terminate_failed=0;constexpr int kIOServiceRequired=1;
 const char *native_msdc_failure=nullptr;
 struct Provider{void release(){}} provider,*gPendingProvider=&provider;
 std::atomic<bool> inside{false}, proceed{false};bool block=false;
-struct NativeMsdcBlock {int starts=0,refs=1; bool start(Provider*){++starts;inside=true;while(block&&!proceed)std::this_thread::yield();return true;}void release(){--refs;}const char*windowLabel(){return "mock";}} device;
+struct NativeMsdcBlock {int starts=0,refs=1,terminations=0;bool inactive=false,fail=false; bool start(Provider*){++starts;inside=true;while(block&&!proceed)std::this_thread::yield();return true;}bool isInactive(){return inactive;}bool terminate(int){++terminations;if(fail)return false;inactive=true;return true;}void release(){--refs;}const char*windowLabel(){return "mock";}} device;
 NativeMsdcBlock *gPending[1]={&device};struct {unsigned count=1,order[1]={0};} gPlan;
 struct {struct {unsigned count=1;} manifest;} gHost;
 bool windowMatchesManifest(NativeMsdcBlock*){return true;}
@@ -29,8 +29,12 @@ post=r'''
 int main(){gPublisherStopped=true;publishThread(nullptr,0);assert(device.starts==0&&!gPending[0]);
  gPending[0]=&device;device.refs=1;gPublisherStopped=false;block=true;std::thread t([]{publishThread(nullptr,0);});
  while(!inside){std::this_thread::yield();} __atomic_store_n(&gPublisherStopped,true,__ATOMIC_RELEASE);proceed=true;t.join();
- assert(device.starts==1&&native_msdc_blocks_published==1);
- puts("PASS cooperative publisher cancellation; reproduced unresolved in-flight publication race");}
+ assert(device.starts==1&&device.inactive&&device.terminations==1&&native_msdc_blocks_published==0&&device.refs==0);
+ gPending[0]=&device;device.refs=1;device.inactive=false;device.fail=true;device.terminations=0;native_msdc_publisher_terminate_failed=0;
+ gPublisherStopped=false;inside=false;proceed=false;std::thread failing([]{publishThread(nullptr,0);});
+ while(!inside){std::this_thread::yield();}__atomic_store_n(&gPublisherStopped,true,__ATOMIC_RELEASE);proceed=true;failing.join();
+ assert(device.terminations==8&&!device.inactive&&native_msdc_publisher_terminate_failed==1&&device.refs==0);
+ puts("PASS actual publisher retires in-flight child; bounded termination failure is observable");}
 '''
 with tempfile.TemporaryDirectory(prefix='publisher-stop-') as d:
  p=Path(d)/'x.cpp';x=Path(d)/'x';p.write_text(pre+body+post)

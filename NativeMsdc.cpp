@@ -1384,7 +1384,12 @@ bool NativeMsdcBlock::start (IOService *provider)
   // The provider and its attached children become inactive in termination
   // phase 1. startMatching also rejects an inactive service under IOKit's
   // arbitration lock, even if termination races this check.
-  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || provider->isInactive () || isInactive ()) return false;
+  if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE) || provider->isInactive () || isInactive ()) {
+    // Balance the successful base start on this failed start path, as
+    // IOService's start contract requires.
+    IOBlockStorageDevice::stop (provider);
+    return false;
+  }
   online = true;
   registerService ();
   return true;
@@ -1855,6 +1860,23 @@ void publishThread (void *, wait_result_t)
       continue;
     }
     gPending[index] = nullptr;          // owned by the registry from here on
+    if (__atomic_load_n (&gPublisherStopped, __ATOMIC_ACQUIRE)) {
+      // Publication was already in flight when stop closed admission. Retire
+      // this child on the publisher thread, never on the stop caller. The
+      // independent parent cleanup remains responsible for earlier children.
+      constexpr unsigned kTerminationAttempts = 8;
+      bool terminated = device->isInactive ();
+      for (unsigned attempt = 0; !terminated && attempt < kTerminationAttempts; ++attempt) {
+        terminated = device->terminate (kIOServiceRequired) || device->isInactive ();
+        if (!terminated && attempt + 1 < kTerminationAttempts) IOSleep (250);
+      }
+      if (!terminated) {
+        __atomic_store_n (&native_msdc_publisher_terminate_failed, 1, __ATOMIC_RELEASE);
+        IOLog ("NativeMsdc: published child remains active after termination retries\n");
+      }
+      device->release ();
+      break;
+    }
     native_msdc_blocks_published = native_msdc_blocks_published + 1;
     IOLog ("NativeMsdc: published %s\n", device->windowLabel ());
     if (position + 1 == gPlan.count) {
