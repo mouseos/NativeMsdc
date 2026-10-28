@@ -339,3 +339,82 @@ individually atomic, not a simultaneous snapshot. This does not measure memory
 bandwidth, CPU time, network or GPU utilization, or end-to-end per-request
 latency. Tests: `python3 tests/irq-fallback-host.py` and
 `python3 tests/irq-worker-host.py`.
+
+### Optional read-submission attribution
+
+`native-msdc-attribution=1` (exactly 1, default off) enables a resident,
+one-shot diagnostic reporter after `NativeMsdc::start` has passed all failure
+returns. It retains the service until it exits. Stop is monotonic, disables
+recording, and the reporter exits after at most its next ten-second sleep;
+the final partial interval is not emitted. The built-in archive is not an
+unloadable diagnostic kext and no restart after stop is supported.
+
+The root hook runs in `doAsyncReadWrite` **before** BlockJob allocation or
+queueing. It records only eligible read offers with the same In direction as
+the existing driver, valid extent and adequate descriptor length. InOut is
+unsupported by the driver and is counted as a skipped direction, not changed
+into a read. Null/zero, nonread direction, extent and short-descriptor skips
+have separate counters. Data-overlay reads are recorded separately at
+`storeTransfer` after its range validation and caller admission guard.
+
+Rows group submit execution PID, thread ID, root-window index, attribute flags
+and size bin (0 <=4KiB, 1 <=16KiB, 2 larger). Window legend lines identify the
+manifest windows; UINT32_MAX denotes the persistent-store backend. PID/TID are
+**execution context**, not proven origin, file owner or file identity. PID0
+must never be described as the application that requested the file. No process
+or vnode pointer/name is retained, looked up or printed.
+
+Flags are 1 has-bufattr, 2 metadata, 4 passive, 8 nocache, 16 static-content,
+32 direct-store. A missing bufattr is unknown, not data. These are real
+`IOStorageAttributes::bufattr` values supplied by IOMediaBSDClient, inspected
+synchronously while that call owns them. Private XNU KPI readers are used;
+there is no manual bufattr layout access. The 32-byte attributes size, bufattr
+offset24 and static-content option0x20 are checked against the pinned
+IOStorageFamily public header. Metadata/passive/static flags do **not** prove
+VM page-in versus syscall read, or identify a specific pathname.
+
+The fixed 128-row table uses a nonblocking trylock and at most eight probes.
+Ten-second snapshots reset the table, sort outside its lock and print top12
+rows plus `other` totals. Each row has a separate span record, joined by sequence
+and rank; full-width numeric records are <=240 bytes. Overflow and contention counters are explicit;
+contention calls/bytes and skipped counters are independently sampled pairs.
+First/last block mean first/last **submitted starting block**, not a min/max
+extent or a repeat detector. Root units are512 bytes; store units are4096.
+No allocations, content reads, console output, new waits, VM lookups or
+completion lifetime changes occur on the recording path. The reporter's
+snapshot buffer is static, not a large kernel-stack object.
+
+This is offered traffic after diagnostic activation, not physical DMA,
+completion bytes, cache-hit count or a census of startup policy-region reads.
+Compare **interval deltas** with existing `native-msdc-iostat=1`, not lifetime
+byte equality. Signed verification block rounding, cache hits, policy reads
+and I/O failures can separate the two totals. Empty intervals and all losses
+remain visible. Diagnostic output is not a throughput qualification.
+
+Host test: `python3 tests/check-read-attribution.py` (C++17 ASan/UBSan).
+It executes the actual KPI hook, reporter formatter/top12/remainder/exit,
+thread-start failure and owner stop checks, plus concurrent table accounting,
+InOut rejection and block-device-off helper compilation. TSan may need a
+supported macOS/Linux host; a runtime initialization failure is not a pass.
+
+Before deployment, compile/prelink the real iOS kernel target. This source
+requires `<sys/proc.h>`, `<sys/buf.h>` with the existing KERNEL_PRIVATE compile
+context, and the core exports `proc_selfpid`, `thread_tid`, `bufattr_meta`,
+`bufattr_passive`, `bufattr_nocache`. No fake declarations or guessed ABI are
+permitted. The existing build uses public IOStorageFamily revision
+`e45fbe30a7879e0b16e26dddb78538f1b00e0bff` via prepare-storage-headers.py.
+Incremental owner build (preserving the active IRQ/worker/verified profile):
+
+```
+XNU_NATIVE_MSDC_BLOCK=1 XNU_MSDC_IRQ_WAIT=1 XNU_MSDC_IRQ_WORKER=1 \
+  python3 scripts/build-arm-driver.py NativeMsdc --verified-root
+```
+
+Rebuild storage bindings/prelink through the existing owner build afterward;
+no GPU/Mesa/Rust rebuild is required. Actual SDK/link and device results must
+be recorded separately from host fixture success.
+
+For VerifiedRoot CPU cost, the existing independent `native-root-timing=1`
+selector enables read/vr_verify_block wall counters even without a new XNU
+ROOT_TIMING build. Preserve that distinction from eager native4k signature
+preparation timing, which requires XNU_ROOT_TIMING compiled into BSD.

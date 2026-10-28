@@ -86,8 +86,127 @@ extern const uint8_t verified_root_key[];         // the owner key, VR_KEY_BYTES
 }
 #endif
 #include "NativeMsdc.h"
+#include "NativeReadAttribution.h"
+#include <sys/proc.h>
+#include <sys/buf.h>
 
 using namespace NativeMsdcHw;
+
+// Optional submission-context evidence, never an origin-PID or completion claim.
+namespace {
+bool gReadAttributionEnabled = false, gReadAttributionStop = false, gReadAttributionStarted = false;
+IOService *gReadAttributionOwner = nullptr;
+NativeReadAttribution::Table gReadAttribution;
+NativeReadAttribution::Snapshot gReadAttributionSnapshot; // reporter only; not kernel stack
+uint64_t gReadAttributionBegin;
+uint64_t gReadAttributionSkipped[4] = {};
+static uint64_t attributionNow() {
+  uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns;
+}
+static void recordAttributedRead(uint32_t window, uint32_t flags, uint64_t bytes, uint64_t block) {
+  if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) || !bytes) return;
+  const uint32_t size = bytes <= 4096 ? 0 : bytes <= 16384 ? 1 : 2;
+  gReadAttribution.record({static_cast<uint32_t>(proc_selfpid()), window, flags, size, thread_tid(current_thread())}, bytes, block);
+}
+#if NATIVE_MSDC_BLOCK_DEVICES
+static void recordAttributedBlockRead(uint32_t window, uint64_t block, uint64_t count,
+                                      uint64_t sectors, IOMemoryDescriptor *buffer, IOStorageAttributes *attributes) {
+  static_assert(sizeof(IOStorageAttributes) == 32 && __builtin_offsetof(IOStorageAttributes, bufattr) == 24,
+                "read attribution requires the pinned IOStorageFamily attributes ABI");
+  static_assert(kIOStorageOptionIsStatic == 0x20, "pinned static-content option");
+  if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE)) return;
+  if (!buffer || !count) { __atomic_fetch_add(&gReadAttributionSkipped[0], 1ULL, __ATOMIC_RELAXED); return; }
+  // Match the driver exactly: InOut is not a supported read direction.
+  if (buffer->getDirection() != kIODirectionIn) { __atomic_fetch_add(&gReadAttributionSkipped[1], 1ULL, __ATOMIC_RELAXED); return; }
+  if (count > UINT64_MAX / 512 || block >= sectors || count > sectors - block) {
+    __atomic_fetch_add(&gReadAttributionSkipped[2], 1ULL, __ATOMIC_RELAXED); return;
+  }
+  if (buffer->getLength() < count * 512) { __atomic_fetch_add(&gReadAttributionSkipped[3], 1ULL, __ATOMIC_RELAXED); return; }
+  uint32_t flags = 0;
+  if (attributes) {
+    if (attributes->options & kIOStorageOptionIsStatic) flags |= 16;
+    if (attributes->bufattr) {
+      flags |= 1;
+      if (bufattr_meta(attributes->bufattr)) flags |= 2;
+      if (bufattr_passive(attributes->bufattr)) flags |= 4;
+      if (bufattr_nocache(attributes->bufattr)) flags |= 8;
+    }
+  }
+  recordAttributedRead(window, flags, count * 512, block);
+}
+#endif
+static void readAttributionThread(void *context, wait_result_t) {
+  IOService *owner = static_cast<IOService *>(context);
+  uint64_t begin = gReadAttributionBegin, sequence = 0;
+  const auto u64 = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+  while (!__atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) {
+    IOSleep(10000);
+    if (__atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) break;
+    const uint64_t sampleBegin = attributionNow();
+    if (!gReadAttribution.drain(gReadAttributionSnapshot)) continue;
+    const uint64_t end = attributionNow();
+    auto &snapshot = gReadAttributionSnapshot;
+    IOLog("NativeMsdc attr begin seq=%llu begin_ns=%llu sample_ns=%llu end_ns=%llu\n",
+          u64(++sequence), u64(begin), u64(sampleBegin), u64(end));
+    IOLog("NativeMsdc attr totals seq=%llu calls=%llu bytes=%llu overflow_calls=%llu overflow_bytes=%llu\n",
+          u64(sequence), u64(snapshot.calls), u64(snapshot.bytes), u64(snapshot.overflowCalls), u64(snapshot.overflowBytes));
+    IOLog("NativeMsdc attr loss seq=%llu contention_calls=%llu contention_bytes=%llu eligible_read_offers=1 non_atomic=1\n",
+          u64(sequence), u64(snapshot.contentionCalls), u64(snapshot.contentionBytes));
+    IOLog("NativeMsdc attr skipped seq=%llu null_or_zero=%llu nonread_direction=%llu extent=%llu short_buffer=%llu\n", u64(sequence),
+          u64(__atomic_exchange_n(&gReadAttributionSkipped[0], 0ULL, __ATOMIC_RELAXED)),
+          u64(__atomic_exchange_n(&gReadAttributionSkipped[1], 0ULL, __ATOMIC_RELAXED)),
+          u64(__atomic_exchange_n(&gReadAttributionSkipped[2], 0ULL, __ATOMIC_RELAXED)),
+          u64(__atomic_exchange_n(&gReadAttributionSkipped[3], 0ULL, __ATOMIC_RELAXED)));
+    uint64_t shownCalls = 0, shownBytes = 0;
+    for (unsigned rank = 0; rank < 12; ++rank) {
+      unsigned best = 128;
+      for (unsigned i = 0; i < 128; ++i)
+        if (snapshot.rows[i].used && (best == 128 || snapshot.rows[i].bytes > snapshot.rows[best].bytes)) best = i;
+      if (best == 128) break;
+      auto &row = snapshot.rows[best];
+      IOLog("NativeMsdc attr row seq=%llu rank=%u submit_pid=%u submit_tid=%llu window=%u flags=%x size=%u calls=%llu bytes=%llu\n",
+            u64(sequence), rank, row.key.pid, u64(row.key.tid), row.key.window, row.key.flags, row.key.size, u64(row.calls), u64(row.bytes));
+      IOLog("NativeMsdc attr span seq=%llu rank=%u first_block=%llu last_block=%llu unit=%u\n",
+            u64(sequence), rank, u64(row.firstBlock), u64(row.lastBlock), (row.key.flags & 32) ? 4096u : 512u);
+      shownCalls += row.calls; shownBytes += row.bytes; row.used = false;
+    }
+    IOLog("NativeMsdc attr end seq=%llu other_calls=%llu other_bytes=%llu\n", u64(sequence),
+          u64(snapshot.calls - snapshot.overflowCalls - shownCalls), u64(snapshot.bytes - snapshot.overflowBytes - shownBytes));
+    begin = end;
+  }
+  __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
+  owner->release();
+}
+static void startReadAttribution(IOService *owner, bool enabled) {
+  if (!enabled || owner->isInactive()) return;
+  bool expected = false;
+  if (!__atomic_compare_exchange_n(&gReadAttributionStarted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+  owner->retain();
+  __atomic_store_n(&gReadAttributionOwner, owner, __ATOMIC_RELEASE);
+  gReadAttributionBegin = attributionNow();
+  // One-shot resident reporter: stop is monotonic and cannot be overwritten by start.
+  if (owner->isInactive() || __atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
+    owner->release(); return;
+  }
+  __atomic_store_n(&gReadAttributionEnabled, true, __ATOMIC_RELEASE);
+  thread_t thread = nullptr;
+  if (kernel_thread_start(readAttributionThread, owner, &thread) != KERN_SUCCESS) {
+    __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&gReadAttributionStop, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE); owner->release();
+    IOLog("NativeMsdc attr unavailable: reporter thread\n"); return;
+  }
+  thread_deallocate(thread);
+}
+static void stopReadAttribution(IOService *owner) {
+  if (__atomic_load_n(&gReadAttributionOwner, __ATOMIC_ACQUIRE) != owner) return;
+  __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&gReadAttributionStop, true, __ATOMIC_RELEASE);
+}
+}
+
 
 extern "C" {
 // Boot diagnostics: 1 started, 2 card ready, 3 userdata found, 4 manifest valid, 5 windows scheduled, 6 windows published.
@@ -1454,9 +1573,11 @@ IOReturn NativeMsdcBlock::synchronizeNow ()
 IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                             IOStorageAttributes *attributes, IOStorageCompletion *completion)
 {
+  recordAttributedBlockRead(window, block, count, sectors, buffer, attributes);
   // Offered block requests, not completions: later validation, verification,
-  // queue saturation or media errors can change the outcome. No user data or
-  // process identity is logged and completion lifetime is unchanged.
+  // queue saturation or media errors can change the outcome. These existing
+  // counters do not record identity; the optional hook above is separate.
+  // No user data or completion lifetime is changed.
   if (gIoTimingEnabled && buffer && count && count <= UINT64_MAX / kSector) {
     IODirection direction = buffer->getDirection ();
     if (direction == kIODirectionIn || direction == kIODirectionOut) {
@@ -2072,6 +2193,11 @@ bool NativeMsdc::start (IOService *provider)
   if (activate) scheduleIrqActivation (this, provider, false);
 #endif
 #endif
+  // No failure return remains after the reporter takes its service reference.
+  startReadAttribution(this, bootArgument("native-msdc-attribution", 1, 0) == 1);
+  if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) && gHost.manifestValid)
+    for (unsigned index = 0; index < gHost.manifest.count; ++index)
+      IOLog("NativeMsdc attr window index=%u name=%.*s\n", index, int(sizeof(gHost.manifest.window[index].name)), gHost.manifest.window[index].name);
   return true;
 }
 
@@ -2133,6 +2259,7 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 
 void NativeMsdc::stop (IOService *provider)
 {
+  stopReadAttribution(this);
 #if NATIVE_MSDC_BLOCK_DEVICES
   // The normal single-provider IOKit termination path marks this service
   // inactive before stop. Record an unexpected direct/active invocation: its
@@ -2177,6 +2304,7 @@ uint64_t reserveBlocks (void)
 bool storeTransfer (uint64_t relative, uint32_t blocks, uint8_t *data, bool write)
 {
   if (!gStoreBlocks || !data || !blocks || relative >= gStoreBlocks || blocks > gStoreBlocks - relative) return false;
+  if (!write) recordAttributedRead(UINT32_MAX, 32, uint64_t(blocks) * kStoreBlock, relative);
   constexpr uint32_t perTransfer = uint32_t (kMaxBlocks / kSectorsPerStoreBlock);
   while (blocks) {
     uint32_t chunk = blocks > perTransfer ? perTransfer : blocks;

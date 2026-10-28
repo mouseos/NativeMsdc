@@ -34,7 +34,9 @@ std::atomic<uint64_t> ticks{100};uint64_t mach_absolute_time(){return ticks.fetc
 struct IOStorageAttributes{unsigned options;};struct IOStorageCompletion{void*target;void(*action)(void*,void*,int,uint64_t);void*parameter;};
 struct IOMemoryDescriptor{int direction=kIODirectionIn;int getDirection(){return direction;}uint8_t data[512]{};uint8_t expected=0;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
 struct IOService{std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
-struct NativeMsdcBlock{bool verifiedActive=true,manifestReadOnly=true,writable=false;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}
+// Attribution is off in this worker-only fixture; actual recorder tested separately.
+static void recordAttributedBlockRead(uint32_t,uint64_t,uint64_t,uint64_t,IOMemoryDescriptor*,IOStorageAttributes*){}
+struct NativeMsdcBlock{uint32_t window=0;uint64_t sectors=UINT64_MAX;bool verifiedActive=true,manifestReadOnly=true,writable=false;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}
  int doSynchronizeCache();int synchronizeNow();int readWriteNow(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);
  int doAsyncReadWrite(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);};
 bool gActivationStopped=false;struct {bool irqReady=true;} gHost;thread_t gIoWorkerThread=nullptr;uint64_t native_msdc_worker_stats[4]{};
