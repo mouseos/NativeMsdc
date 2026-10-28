@@ -42,6 +42,9 @@ post=r'''
 int main(){NativeMsdc owner;IOService provider;NativeMsdcBlock child;owner.retain();failAttempts=1;std::thread cleanup([&]{publisherCleanupThread(&owner,0);});
  gate=true;std::thread pub([&]{assert(child.start(&owner));});while(!entered)std::this_thread::yield();owner.stop(&provider);
  while(!childInactive){std::this_thread::yield();} assert(parentInactive);go=true;pub.join();cleanup.join();assert(!matched&&attempts==2&&owner.refs==1);
+ parentInactive=false;childInactive=false;gPublisherStopped=false;gPublisherCleanup=0;gate=false;matched=0;attempts=0;failAttempts=0;
+ NativeMsdcBlock prior;assert(prior.start(&owner)&&matched==1);owner.stop(&provider);owner.retain();publisherCleanupThread(&owner,0);
+ assert(parentInactive&&childInactive&&owner.refs==1&&attempts==1);
  parentInactive=false;childInactive=false;gPublisherCleanup=2;owner.retain();publisherCleanupThread(&owner,0);assert(!parentInactive&&owner.refs==1);
  parentInactive=false;childInactive=false;gPublisherCleanup=0;gPublisherStopped=false;failAttempts=0;attempts=0;
  owner.stop(&provider);owner.retain();publisherCleanupThread(&owner,0);assert(parentInactive&&childInactive&&owner.refs==1&&attempts==1);
