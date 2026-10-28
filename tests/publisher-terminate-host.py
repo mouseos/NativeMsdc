@@ -24,7 +24,7 @@ constexpr int THREAD_UNINT=0,THREAD_WAITING=1,THREAD_AWAKENED=2,kIOServiceRequir
 #define NATIVE_MSDC_BLOCK_DEVICES 1
 #define NATIVE_MSDC_IRQ_WAIT 0
 #define IOLog(...) do {} while(0)
-bool gPublisherStopped=false;uint32_t gPublisherCleanup=0;uint32_t native_msdc_publisher_terminate_failed=0;
+bool gPublisherStopped=false;uint32_t gPublisherCleanup=0;uint32_t native_msdc_publisher_terminate_failed=0;uint64_t native_msdc_stop_while_active=0;
 std::mutex events,arb;std::condition_variable cv;bool signaled=false;std::atomic<int> attempts{0};int failAttempts=0;
 int assert_wait(event_t,int){return THREAD_WAITING;}thread_t current_thread(){return nullptr;}
 int clear_wait(thread_t,int){return 0;}void thread_wakeup(event_t){std::lock_guard<std::mutex> l(events);signaled=true;cv.notify_all();}
@@ -52,7 +52,7 @@ int main(){NativeMsdc owner;IOService provider;NativeMsdcBlock child;owner.retai
  // Reverse ordering: a direct stop does not immediately make children inactive.
  parentInactive=false;childInactive=false;gPublisherStopped=false;gPublisherCleanup=0;gate=true;go=false;entered=false;matched=0;
  NativeMsdcBlock late;std::thread direct([&]{assert(late.start(&owner));});while(!entered)std::this_thread::yield();
- owner.stop(&provider);go=true;direct.join();assert(matched==1 && !parentInactive);
+ uint64_t activeStops=native_msdc_stop_while_active;owner.stop(&provider);go=true;direct.join();assert(matched==1 && !parentInactive && native_msdc_stop_while_active==activeStops+1);
  owner.retain();publisherCleanupThread(&owner,0);assert(parentInactive && childInactive && owner.refs==1);
  // Permanent failure is bounded and visible; no false inactive state.
  parentInactive=false;childInactive=false;gPublisherStopped=false;gPublisherCleanup=0;native_msdc_publisher_terminate_failed=0;attempts=0;failAttempts=100;
@@ -60,7 +60,7 @@ int main(){NativeMsdc owner;IOService provider;NativeMsdcBlock child;owner.retai
  assert(attempts==8 && native_msdc_publisher_terminate_failed==1 && !parentInactive && owner.refs==1);
  // Normal single-provider termination marks the parent and child inactive before stop.
  parentInactive=true;childInactive=true;gPublisherStopped=false;gPublisherCleanup=0;attempts=0;failAttempts=0;matched=0;
- owner.stop(&provider);NativeMsdcBlock inactive;assert(!inactive.start(&owner)&&!matched);
+ activeStops=native_msdc_stop_while_active;owner.stop(&provider);NativeMsdcBlock inactive;assert(!inactive.start(&owner)&&!matched && native_msdc_stop_while_active==activeStops);
  owner.retain();publisherCleanupThread(&owner,0);assert(attempts==0&&owner.refs==1);
  puts("PASS modeled lifecycle, direct-stop reverse race, eventual cleanup, bounded failure and lifetime");}
 '''

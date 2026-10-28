@@ -309,3 +309,10 @@ Stop can nevertheless wait for that SPI/MMIO operation to finish, so it is not
 a proven wait-free operation. Independently, direct stop can race registration
 before the asynchronous cleanup makes the parent inactive. Do not interpret a
 passing model as establishing either property for arbitrary stop callers.
+
+`native_msdc_stop_while_active` counts stop calls observed while the service is
+still active. In the XNU single-provider path `requestTerminate` delegates to
+`terminateClient`, which invokes the child's `terminate` and marks it inactive
+before the later stop action. A nonzero count is evidence that this expected
+lifecycle ordering was not observed; it does not itself repair direct-stop
+publication races or guarantee a complete teardown.

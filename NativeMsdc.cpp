@@ -98,6 +98,7 @@ volatile uint32_t native_msdc_dma = 0;                      // 0 PIO, 1 DMA veri
 volatile uint32_t native_msdc_blocks_published = 0;
 #if NATIVE_MSDC_BLOCK_DEVICES
 volatile uint32_t native_msdc_publisher_terminate_failed = 0;
+volatile uint64_t native_msdc_stop_while_active = 0;
 #endif
 #if NATIVE_MSDC_IRQ_WAIT
 // IRQs captured, wait attempts, delivery fallback, elapsed wait nanoseconds.
@@ -2060,6 +2061,10 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 void NativeMsdc::stop (IOService *provider)
 {
 #if NATIVE_MSDC_BLOCK_DEVICES
+  // The normal single-provider IOKit termination path marks this service
+  // inactive before stop. Record an unexpected direct/active invocation: its
+  // asynchronous cleanup is not an immediate publication barrier.
+  if (!isInactive ()) __atomic_fetch_add (&native_msdc_stop_while_active, 1, __ATOMIC_RELAXED);
   __atomic_store_n (&gPublisherStopped, true, __ATOMIC_RELEASE);
   __atomic_store_n (&gPublisherCleanup, 1, __ATOMIC_RELEASE);
   thread_wakeup (reinterpret_cast<event_t> (&gPublisherCleanup));
