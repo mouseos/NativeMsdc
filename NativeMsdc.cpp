@@ -96,6 +96,9 @@ const char *volatile native_msdc_failure = nullptr;
 volatile uint32_t native_msdc_manifest_status = 0xffffffff;
 volatile uint32_t native_msdc_dma = 0;                      // 0 PIO, 1 DMA verified, 2 DMA rejected, 3 quarantined
 volatile uint32_t native_msdc_blocks_published = 0;
+#if NATIVE_MSDC_BLOCK_DEVICES
+volatile uint32_t native_msdc_publisher_terminate_failed = 0;
+#endif
 #if NATIVE_MSDC_IRQ_WAIT
 // IRQs captured, wait attempts, delivery fallback, elapsed wait nanoseconds.
 volatile uint64_t native_msdc_irq_stats[4] = {};
@@ -1785,9 +1788,17 @@ void publisherCleanupThread (void *argument, wait_result_t)
     }
   }
   if (action == 1) {
-    while (!owner->isInactive () && !owner->terminate (kIOServiceRequired)) {
-      IOLog ("NativeMsdc: publisher termination failed; retrying\n");
-      IOSleep (250);
+    // Resource failure cannot leave a kernel thread retrying forever. Failure
+    // is observable; a still-active parent is not claimed to be terminated.
+    constexpr unsigned kTerminationAttempts = 8;
+    bool terminated = owner->isInactive ();
+    for (unsigned attempt = 0; !terminated && attempt < kTerminationAttempts; ++attempt) {
+      terminated = owner->terminate (kIOServiceRequired) || owner->isInactive ();
+      if (!terminated && attempt + 1 < kTerminationAttempts) IOSleep (250);
+    }
+    if (!terminated) {
+      __atomic_store_n (&native_msdc_publisher_terminate_failed, 1, __ATOMIC_RELEASE);
+      IOLog ("NativeMsdc: publisher parent remains active after termination retries\n");
     }
   }
   owner->release ();

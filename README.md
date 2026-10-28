@@ -284,17 +284,28 @@ not use the ArmCpu shared lock remain an integration assumption.
 
 The publisher has an independently retained cleanup thread, started before
 publication is admitted. Stop signals that thread without waiting for it. It
-calls `terminate(kIOServiceRequired)` on the parent, retrying
-termination failure until the parent is inactive. XNU termination recursively
+calls `terminate(kIOServiceRequired)` on the parent, retrying failure at most
+eight times. Exhaustion sets `native_msdc_publisher_terminate_failed`; the
+parent may remain active and teardown has not been proved. XNU termination recursively
 makes attached single-provider children inactive; its `startMatching` checks
 inactive under arbitration. A publication already committed before stop may
 briefly match until this asynchronous teardown takes effect; stop returning is
-not a synchronous teardown barrier. This assumes termination eventually succeeds
-and that the child remains a single-provider client of this parent. The host
-lifecycle model exercises an in-flight registration, retry, startup ordering,
+not a synchronous teardown barrier. The matching guarantee assumes successful
+termination and that the child remains a single-provider client of this parent. The host
+lifecycle model includes both registration/termination orders, retry and
+permanent failure, startup ordering,
 abort, wake-before-wait and retained lifetimes; actual IOKit teardown and
 hardware execution remain unverified. `python3 tests/publisher-terminate-host.py`
 uses the real driver functions with mocked IOKit state, not the XNU workloop.
 The narrower `publisher-child-start-host.py` and `publisher-stop-host.py` tests
 still reproduce the race without the cleanup thread and are not whole-driver
 tests.
+
+The activation/stop lock order is host mutex, activation mutex, then ArmCpu's
+SPI spin lock for attachment; stop sets its cancellation flag first and then
+acquires the activation mutex, never the host mutex. ArmCpu's guarded region
+contains register operations and table updates, not callbacks or allocations.
+Stop can nevertheless wait for that SPI/MMIO operation to finish, so it is not
+a proven wait-free operation. Independently, direct stop can race registration
+before the asynchronous cleanup makes the parent inactive. Do not interpret a
+passing model as establishing either property for arbitrary stop callers.

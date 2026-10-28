@@ -24,7 +24,7 @@ constexpr int THREAD_UNINT=0,THREAD_WAITING=1,THREAD_AWAKENED=2,kIOServiceRequir
 #define NATIVE_MSDC_BLOCK_DEVICES 1
 #define NATIVE_MSDC_IRQ_WAIT 0
 #define IOLog(...) do {} while(0)
-bool gPublisherStopped=false;uint32_t gPublisherCleanup=0;
+bool gPublisherStopped=false;uint32_t gPublisherCleanup=0;uint32_t native_msdc_publisher_terminate_failed=0;
 std::mutex events,arb;std::condition_variable cv;bool signaled=false;std::atomic<int> attempts{0};int failAttempts=0;
 int assert_wait(event_t,int){return THREAD_WAITING;}thread_t current_thread(){return nullptr;}
 int clear_wait(thread_t,int){return 0;}void thread_wakeup(event_t){std::lock_guard<std::mutex> l(events);signaled=true;cv.notify_all();}
@@ -48,7 +48,20 @@ int main(){NativeMsdc owner;IOService provider;NativeMsdcBlock child;owner.retai
  parentInactive=false;childInactive=false;gPublisherCleanup=2;owner.retain();publisherCleanupThread(&owner,0);assert(!parentInactive&&owner.refs==1);
  parentInactive=false;childInactive=false;gPublisherCleanup=0;gPublisherStopped=false;failAttempts=0;attempts=0;
  owner.stop(&provider);owner.retain();publisherCleanupThread(&owner,0);assert(parentInactive&&childInactive&&owner.refs==1&&attempts==1);
- puts("PASS actual stop/cleanup/start: nonblocking stop, failed terminate retry, parent inactive, in-flight registration rejected, abort and lifetime");}
+ // Reverse ordering: a direct stop does not immediately make children inactive.
+ parentInactive=false;childInactive=false;gPublisherStopped=false;gPublisherCleanup=0;gate=true;go=false;entered=false;matched=0;
+ NativeMsdcBlock late;std::thread direct([&]{assert(late.start(&owner));});while(!entered)std::this_thread::yield();
+ owner.stop(&provider);go=true;direct.join();assert(matched==1 && !parentInactive);
+ owner.retain();publisherCleanupThread(&owner,0);assert(parentInactive && childInactive && owner.refs==1);
+ // Permanent failure is bounded and visible; no false inactive state.
+ parentInactive=false;childInactive=false;gPublisherStopped=false;gPublisherCleanup=0;native_msdc_publisher_terminate_failed=0;attempts=0;failAttempts=100;
+ owner.stop(&provider);owner.retain();publisherCleanupThread(&owner,0);
+ assert(attempts==8 && native_msdc_publisher_terminate_failed==1 && !parentInactive && owner.refs==1);
+ // Normal single-provider termination marks the parent and child inactive before stop.
+ parentInactive=true;childInactive=true;gPublisherStopped=false;gPublisherCleanup=0;attempts=0;failAttempts=0;matched=0;
+ owner.stop(&provider);NativeMsdcBlock inactive;assert(!inactive.start(&owner)&&!matched);
+ owner.retain();publisherCleanupThread(&owner,0);assert(attempts==0&&owner.refs==1);
+ puts("PASS modeled lifecycle, direct-stop reverse race, eventual cleanup, bounded failure and lifetime");}
 '''
 with tempfile.TemporaryDirectory(prefix='publisher-terminate-') as d:
  p=Path(d)/'test.cpp';x=Path(d)/'test';p.write_text(pre+child+cleanup+stop+post)
