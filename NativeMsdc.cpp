@@ -70,6 +70,7 @@
 #include <kern/sched_prim.h>
 #include <machine/machine_routines.h>
 extern "C" int get_preemption_level (void);
+extern "C" bool armcpu_spi_boot_ready (void);
 extern "C" IOReturn armcpu_spi_attach_sysirq (uint32_t, volatile uint32_t *, void (*) (void *), void *,
                                                uint32_t *, uint64_t *, bool *);
 extern "C" bool armcpu_spi_mask_owned (uint32_t, void (*) (void *), void *);
@@ -244,7 +245,7 @@ IOReturn waitDmaIrq (uint64_t end)
       gHost.irqArmed = false;
       bool noDelivery = slept && mach_absolute_time () >= probeEnd && !gHost.irqDelivered;
       if (noDelivery) {
-        gHost.irqReady = false;
+        __atomic_store_n (&gHost.irqReady, false, __ATOMIC_RELEASE);
         __atomic_fetch_add (&native_msdc_irq_stats[2], 1, __ATOMIC_RELAXED);
       }
       IOSimpleLockUnlockEnableInterrupt (gHost.irqLock, state);
@@ -254,7 +255,7 @@ IOReturn waitDmaIrq (uint64_t end)
       if (observed & (kIntDataErrors | kIntDmaErrors)) return kIOReturnIOError;
       if (observed & kIntXferDone) return kIOReturnSuccess;
       // Delivery was not proven; do not pay this delay on subsequent reads.
-      gHost.irqReady = false;
+      __atomic_store_n (&gHost.irqReady, false, __ATOMIC_RELEASE);
       return kIOReturnNotReady;
     }
     wait_result_t pending = assert_wait_deadline (reinterpret_cast<event_t> (&gHost.irqStatus), THREAD_UNINT, probeEnd);
@@ -443,7 +444,7 @@ IOReturn hostReadDma (uint32_t argument, uint8_t *buffer, uint32_t blocks, bool 
 #else
     const bool publisherContext = false;
 #endif
-    if (publisherContext && gHost.irqReady && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE) &&
+    if (publisherContext && __atomic_load_n (&gHost.irqReady, __ATOMIC_ACQUIRE) && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE) &&
         ml_get_interrupts_enabled () && get_preemption_level () == 0) {
       result = waitDmaIrq (end);
     } else result = kIOReturnNotReady;
@@ -773,9 +774,9 @@ void hostEnableIrq (IOService *provider)
   // A failed enable/readback may still have published a handler. ArmCpu
   // attempts to mask the source; keep the handler state alive even if the
   // readback says that masking failed.
-  gHost.irqReady = status == kIOReturnSuccess && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE);
+  __atomic_store_n (&gHost.irqReady, status == kIOReturnSuccess && !__atomic_load_n (&gHost.irqFault, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
   IOLog ("NativeMsdc: IRQ wait %s spi=%u gic=0x%x target=0x%llx\n",
-         gHost.irqReady ? "ready" : "unavailable", spi, readback, target);
+         __atomic_load_n (&gHost.irqReady, __ATOMIC_ACQUIRE) ? "ready" : "unavailable", spi, readback, target);
 }
 #endif
 
@@ -1231,7 +1232,7 @@ void stopBlockWorker ()
 
 bool startBlockWorker (IOService *parent)
 {
-  if (!gHost.irqReady) return false;
+  if (!__atomic_load_n (&gHost.irqReady, __ATOMIC_ACQUIRE)) return false;
   gBlockQueueLock = IOLockAlloc ();
   if (!gBlockQueueLock) return false;
   gBlockParent = parent; gBlockAccept = true;
@@ -1787,6 +1788,60 @@ IOService *NativeMsdc::probe (IOService *provider, SInt32 *score)
   return this;
 }
 
+#if NATIVE_MSDC_IRQ_WAIT
+namespace {
+// One activation thread per controller. The lifecycle mutex serializes stop
+// with both registration and worker startup; it is never held while waiting
+// for the boot CPU to publish GIC readiness. It stays allocated with gHost.
+IOLock *gActivationLock = nullptr;
+bool gActivationStopped = false;
+struct IrqActivation { NativeMsdc *owner; IOService *provider; bool worker; };
+
+void activateIrq (void *argument, wait_result_t)
+{
+  IrqActivation *activation = static_cast<IrqActivation *> (argument);
+  bool ready = false;
+  for (unsigned attempt = 0; attempt < 600; ++attempt) {
+    if (__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE)) break;
+    if (armcpu_spi_boot_ready ()) { ready = true; break; }
+    IOSleep (100);
+  }
+  IOLockLock (gActivationLock);
+  if (ready && !__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE)) {
+    // hostEnableIrq holds HostSession while it tests inherited masks and
+    // attaches, so it cannot cross an in-flight polling transfer.
+    hostEnableIrq (activation->provider);
+#if NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_WORKER_EXPERIMENT
+    if (activation->worker && __atomic_load_n (&gHost.irqReady, __ATOMIC_ACQUIRE) &&
+        !startBlockWorker (activation->owner))
+      IOLog ("NativeMsdc: block worker unavailable; polling\n");
+#endif
+  } else if (!ready && !__atomic_load_n (&gActivationStopped, __ATOMIC_ACQUIRE)) {
+    IOLog ("NativeMsdc: GIC readiness timed out; polling\n");
+  }
+  IOLockUnlock (gActivationLock);
+  activation->provider->release ();
+  activation->owner->release ();
+  IOFree (activation, sizeof (*activation));
+}
+
+void scheduleIrqActivation (NativeMsdc *owner, IOService *provider, bool worker)
+{
+  IrqActivation *activation = static_cast<IrqActivation *> (IOMalloc (sizeof (*activation)));
+  if (!activation) { IOLog ("NativeMsdc: IRQ activation allocation failed; polling\n"); return; }
+  *activation = { owner, provider, worker };
+  owner->retain (); provider->retain ();
+  thread_t thread = nullptr;
+  if (kernel_thread_start (activateIrq, activation, &thread) != KERN_SUCCESS) {
+    provider->release (); owner->release (); IOFree (activation, sizeof (*activation));
+    IOLog ("NativeMsdc: IRQ activation thread unavailable; polling\n");
+    return;
+  }
+  thread_deallocate (thread);
+}
+}
+#endif
+
 bool NativeMsdc::start (IOService *provider)
 {
 #if NATIVE_MSDC_VERIFIED
@@ -1810,31 +1865,31 @@ bool NativeMsdc::start (IOService *provider)
     return false;
   }
 #if NATIVE_MSDC_IRQ_WAIT
-  if (bootArgument ("native-msdc-irq", 1, 0) == 1) hostEnableIrq (provider);
+  bool activate = bootArgument ("native-msdc-irq", 1, 0) == 1;
+  if (activate) {
+    gActivationLock = IOLockAlloc ();
+    if (!gActivationLock) { IOLog ("NativeMsdc: IRQ lifecycle lock unavailable; polling\n"); activate = false; }
+  }
 #endif
   if (!gHost.manifestValid) fail (manifestReason (native_msdc_manifest_status));
 #if NATIVE_MSDC_BLOCK_DEVICES
   else if (root) {
-#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_WORKER_EXPERIMENT
-    if (gHost.irqReady && !startBlockWorker (this)) {
-      if (!__atomic_load_n (&gBlockEnabled, __ATOMIC_ACQUIRE)) {
-        fail ("block worker lifecycle lock unavailable");
-        IOService::stop (provider);
-        return false;
-      }
-      IOLog ("NativeMsdc: block worker unavailable; polling\n");
-    }
-#endif
     gVerifyWindows = bootArgument ("native-msdc-verify", 1, 0) == 1;
     if (!startRoot (root == 2, &why)) {
 #if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_WORKER_EXPERIMENT
       stopBlockWorker ();
 #endif
       fail (why);
+#if NATIVE_MSDC_IRQ_WAIT
+      activate = false;
+#endif
     }
   }
 #else
   else if (root) fail ("native-msdc-root: built without the window block devices (NATIVE_MSDC_BLOCK_DEVICES=0)");
+#endif
+#if NATIVE_MSDC_IRQ_WAIT
+  if (activate) scheduleIrqActivation (this, provider, root && gHost.manifestValid);
 #endif
   return true;
 }
@@ -1883,6 +1938,13 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 
 void NativeMsdc::stop (IOService *provider)
 {
+#if NATIVE_MSDC_IRQ_WAIT
+  if (gActivationLock) {
+    IOLockLock (gActivationLock);
+    __atomic_store_n (&gActivationStopped, true, __ATOMIC_RELEASE);
+    IOLockUnlock (gActivationLock);
+  }
+#endif
 #if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_WORKER_EXPERIMENT
   stopBlockWorker ();
 #endif

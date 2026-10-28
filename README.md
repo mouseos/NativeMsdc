@@ -267,3 +267,17 @@ model synchronization and are not physical DMA or data-integrity evidence.
 Run `python3 tests/irq-wait-host.py`, `python3 tests/irq-dma-host.py`,
 `python3 tests/irq-setup-host.py`, `python3 tests/irq-fallback-host.py`,
 `python3 tests/irq-caller-policy.py`, and `python3 tests/irq-worker-host.py`.
+
+When the experimental IRQ mode is requested, a retained activation thread waits
+up to 60 seconds for `armcpu_spi_boot_ready()` without holding the host mutex.
+Until activation, publication and block requests retain the polled path. Once
+ready it makes exactly one registration attempt under the host mutex; rejected
+metadata, inherited interrupts, allocation failure, or any attach failure is
+terminal for this boot. A lifecycle mutex serializes registration and worker
+creation with stop. The publisher still starts independently, and the worker
+is started only for a valid root with successful IRQ registration. The GIC
+readiness API requires a matching ArmCpu build with release/acquire publication.
+`python3 tests/irq-activation-host.py` covers delayed readiness, terminal
+failure, ownership and stop races with host mocks; it does not validate hardware
+IRQ delivery or prove a latency improvement. External SYSIRQ writers that do
+not use the ArmCpu shared lock remain an integration assumption.
