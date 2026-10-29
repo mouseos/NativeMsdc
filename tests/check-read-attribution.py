@@ -23,7 +23,7 @@ static_assert(sizeof(constantTable)==sizeof(NativeReadAttribution::Table),"const
 static_assert(std::is_trivially_destructible<NativeReadAttribution::Table>::value,"no teardown initializer");
 static bool gReadAttributionEnabled=false,gReadAttributionStop=false,gReadAttributionStarted=false;
 static NativeReadAttribution::Table gReadAttribution;
-static bool gOverlapTraceEnabled=false;
+static bool gOverlapTraceEnabled=false,gOverlapTraceRequested=false;
 static NativeOverlapTrace::Buffer gOverlapTrace;
 static NativeOverlapTrace::Snapshot gOverlapTraceSnapshot;
 static uint64_t attributionNow();
@@ -121,8 +121,10 @@ recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
 const unsigned clockBeforeReport=clockCalls;
 pendingThread(pendingContext,0);
 assert(output.find("NativeMsdc overlap event")!=std::string::npos);
+assert(output.find("begin_ns=123 sample_ns=123")!=std::string::npos);
 assert(output.find("NativeMsdc attr ")==std::string::npos);
-assert(clockCalls==clockBeforeReport);
+assert(output.find("NativeMsdc overlap stopped final_interval_unreported=1")!=std::string::npos);
+assert(clockCalls==clockBeforeReport+1);
 assert(gReadAttribution.drain(snap)&&snap.calls==20);
 // Both streams enabled: each gets its own framed report.
 gReadAttributionStarted=false;gReadAttributionStop=false;sleepCalls=0;output.clear();logs=0;

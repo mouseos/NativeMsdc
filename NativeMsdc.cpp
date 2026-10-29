@@ -100,7 +100,7 @@ IOService *gReadAttributionOwner = nullptr;
 NativeReadAttribution::Table gReadAttribution;
 NativeReadAttribution::Snapshot gReadAttributionSnapshot; // reporter only; not kernel stack
 uint64_t gReadAttributionBegin;
-bool gOverlapTraceEnabled = false;
+bool gOverlapTraceEnabled = false, gOverlapTraceRequested = false;
 NativeOverlapTrace::Buffer gOverlapTrace;
 NativeOverlapTrace::Snapshot gOverlapTraceSnapshot; // reporter only
 
@@ -151,22 +151,26 @@ static void recordAttributedBlockRead(uint32_t window, uint64_t block, uint64_t 
 #endif
 static void readAttributionThread(void *context, wait_result_t) {
   IOService *owner = static_cast<IOService *>(context);
-  uint64_t begin = gReadAttributionBegin, sequence = 0, traceSequence = 0;
+  uint64_t begin = gReadAttributionBegin, traceBegin = gReadAttributionBegin, sequence = 0, traceSequence = 0;
   const auto u64 = [](uint64_t value) { return static_cast<unsigned long long>(value); };
   while (!__atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) {
     IOSleep(10000);
     if (__atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) break;
-    if (__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE) && gOverlapTrace.drain(gOverlapTraceSnapshot)) {
-      auto &trace = gOverlapTraceSnapshot;
-      ++traceSequence;
-      IOLog("NativeMsdc overlap begin seq=%llu count=%llu full=%llu contention=%llu unit=512 prequeue=1\n",
-            u64(traceSequence), u64(trace.count), u64(trace.full), u64(trace.contention));
-      for (uint64_t i = 0; i < trace.count; ++i) {
-        const auto &e = trace.events[i];
-        IOLog("NativeMsdc overlap event seq=%llu index=%llu ns=%llu pid=%u tid=%llu window=%u block=%llu count=%llu\n",
-              u64(traceSequence), u64(i), u64(e.ns), e.pid, u64(e.tid), e.window, u64(e.block), u64(e.count));
+    if (__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) {
+      const uint64_t traceSample = attributionNow();
+      if (gOverlapTrace.drain(gOverlapTraceSnapshot)) {
+        auto &trace = gOverlapTraceSnapshot;
+        ++traceSequence;
+        IOLog("NativeMsdc overlap begin seq=%llu begin_ns=%llu sample_ns=%llu count=%llu full=%llu contention=%llu unit=512 prequeue=1\n",
+              u64(traceSequence), u64(traceBegin), u64(traceSample), u64(trace.count), u64(trace.full), u64(trace.contention));
+        for (uint64_t i = 0; i < trace.count; ++i) {
+          const auto &e = trace.events[i];
+          IOLog("NativeMsdc overlap event seq=%llu index=%llu ns=%llu pid=%u tid=%llu window=%u block=%llu count=%llu\n",
+                u64(traceSequence), u64(i), u64(e.ns), e.pid, u64(e.tid), e.window, u64(e.block), u64(e.count));
+        }
+        IOLog("NativeMsdc overlap end seq=%llu\n", u64(traceSequence));
+        traceBegin = traceSample;
       }
-      IOLog("NativeMsdc overlap end seq=%llu\n", u64(traceSequence));
     }
     if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE)) continue;
     const uint64_t sampleBegin = attributionNow();
@@ -201,6 +205,8 @@ static void readAttributionThread(void *context, wait_result_t) {
           u64(snapshot.calls - snapshot.overflowCalls - shownCalls), u64(snapshot.bytes - snapshot.overflowBytes - shownBytes));
     begin = end;
   }
+  if (__atomic_load_n(&gOverlapTraceRequested, __ATOMIC_ACQUIRE))
+    IOLog("NativeMsdc overlap stopped final_interval_unreported=1\n");
   __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
   __atomic_store_n(&gOverlapTraceEnabled, false, __ATOMIC_RELEASE);
   __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
@@ -211,8 +217,9 @@ static void startReadAttribution(IOService *owner, bool enabled, bool trace = fa
   bool expected = false;
   if (!__atomic_compare_exchange_n(&gReadAttributionStarted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
   owner->retain();
+  __atomic_store_n(&gOverlapTraceRequested, trace, __ATOMIC_RELEASE);
   __atomic_store_n(&gReadAttributionOwner, owner, __ATOMIC_RELEASE);
-  if (enabled) gReadAttributionBegin = attributionNow();
+  if (enabled || trace) gReadAttributionBegin = attributionNow();
   // One-shot resident reporter: stop is monotonic and cannot be overwritten by start.
   if (owner->isInactive() || __atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) {
     __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);

@@ -440,10 +440,13 @@ that interval), with PID/TID of the submission context, boot-relative
 `mach_absolute_time` in ns, window-relative block/count in 512-byte sectors.
 `full` counts offers dropped after observing saturation; `contention` counts
 try-lock failures. After saturation, timestamps and identities are not fetched.
-Both counters are exact across quiescent drains, but sampled independently; an
+The begin and sample timestamps show the period even if an earlier drain
+failed. The sample timestamp is taken before the drain lock, so it is not an
+atomic boundary for records or counters. Both counters are exact across quiescent drains, but sampled independently; an
 offer racing a drain can be counted in an adjacent interval. Drain failure
 retains the buffer for a later interval. A stopped reporter discards its final
-partial interval. Empty reports are emitted, and reporting itself may perturb
+partial interval and emits `stopped final_interval_unreported=1`, so its final
+losses are not counted. Empty reports are emitted, and reporting itself may perturb
 timing. Never interpret absent overlap as proof of no overlap when data is
 sampled or lost. This diagnostic exposes block ranges, which can identify data
 on a known image; it never emits data bytes or process names.
