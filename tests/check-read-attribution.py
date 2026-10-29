@@ -21,7 +21,7 @@ source=r'''
 constexpr NativeReadAttribution::Table constantTable{};
 static_assert(sizeof(constantTable)==sizeof(NativeReadAttribution::Table),"constant initialization");
 static_assert(std::is_trivially_destructible<NativeReadAttribution::Table>::value,"no teardown initializer");
-static bool gReadAttributionEnabled=false,gReadAttributionStop=false,gReadAttributionStarted=false;
+static bool gReadAttributionEnabled=false,gReadAttributionStop=false,gReadAttributionStarted=false,gReadAttributionRequested=false;
 static NativeReadAttribution::Table gReadAttribution;
 static bool gOverlapTraceEnabled=false,gOverlapTraceRequested=false;
 static NativeOverlapTrace::Buffer gOverlapTrace;
@@ -87,7 +87,7 @@ buffer.direction=kIODirectionIn;recordAttributedBlockRead(1,2,16,100,&buffer,nul
 recordAttributedRead(UINT32_MAX,32,4096,5);assert(pidCalls==3);assert(gReadAttribution.drain(snap)&&snap.calls==2);
 stopReadAttribution(&other);assert(gReadAttributionEnabled);
 logs=0;pendingThread(pendingContext,0);assert(owner.refs==1&&!gReadAttributionEnabled&&gReadAttributionOwner==nullptr);
-assert(sleepCalls==2&&logs==29);assert(output.find("other_calls=8 other_bytes=32768")!=std::string::npos);
+assert(sleepCalls==2&&logs==30);assert(output.find("NativeMsdc attr stopped final_interval_unreported=1")!=std::string::npos);assert(output.find("other_calls=8 other_bytes=32768")!=std::string::npos);
 output.clear();logs=0;
 stopReadAttribution(&owner);assert(!gReadAttributionEnabled&&gReadAttributionStop);
 // Fresh one-shot fixture: prove same-owner stop, without IOSleep setting the flag.
@@ -105,7 +105,7 @@ assert(starts==beforeStarts&&owner.refs==1&&!gReadAttributionEnabled&&gReadAttri
 gReadAttributionStarted=false;gReadAttributionStop=false;owner.inactive=true;
 unsigned beforeClock=clockCalls;startReadAttribution(&owner,true);
 assert(!gReadAttributionStarted&&starts==beforeStarts&&clockCalls==beforeClock&&owner.refs==1);owner.inactive=false;
-gReadAttributionStarted=false;gReadAttributionOwner=nullptr;gReadAttributionStop=false;failThread=true;startReadAttribution(&owner,true);assert(!gReadAttributionEnabled&&gReadAttributionStop&&owner.refs==1&&logs==1);
+gReadAttributionStarted=false;gReadAttributionOwner=nullptr;gReadAttributionStop=false;failThread=true;logs=0;startReadAttribution(&owner,true);assert(!gReadAttributionEnabled&&gReadAttributionStop&&owner.refs==1&&logs==1);
 NativeReadAttribution::Table table;std::atomic<unsigned> done{0};std::vector<std::thread> threads;
 for(unsigned j=0;j<4;j++)threads.emplace_back([&,j]{for(unsigned i=0;i<10000;i++)table.record({j,1,0,0,j+1},4096,i);done++;});
 uint64_t total=0,bytes=0;

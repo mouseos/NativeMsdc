@@ -346,7 +346,8 @@ latency. Tests: `python3 tests/irq-fallback-host.py` and
 one-shot diagnostic reporter after `NativeMsdc::start` has passed all failure
 returns. It retains the service until it exits. Stop is monotonic, disables
 recording, and the reporter exits after at most its next ten-second sleep;
-the final partial interval is not emitted. The built-in archive is not an
+the final partial interval is not emitted, and the reporter emits
+`NativeMsdc attr stopped final_interval_unreported=1`. The built-in archive is not an
 unloadable diagnostic kext and no restart after stop is supported.
 
 The root hook runs in `doAsyncReadWrite` **before** BlockJob allocation or

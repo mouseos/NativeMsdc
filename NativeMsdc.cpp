@@ -96,6 +96,7 @@ using namespace NativeMsdcHw;
 // Optional submission-context evidence, never an origin-PID or completion claim.
 namespace {
 bool gReadAttributionEnabled = false, gReadAttributionStop = false, gReadAttributionStarted = false;
+bool gReadAttributionRequested = false;
 IOService *gReadAttributionOwner = nullptr;
 NativeReadAttribution::Table gReadAttribution;
 NativeReadAttribution::Snapshot gReadAttributionSnapshot; // reporter only; not kernel stack
@@ -207,6 +208,8 @@ static void readAttributionThread(void *context, wait_result_t) {
   }
   if (__atomic_load_n(&gOverlapTraceRequested, __ATOMIC_ACQUIRE))
     IOLog("NativeMsdc overlap stopped final_interval_unreported=1\n");
+  if (__atomic_load_n(&gReadAttributionRequested, __ATOMIC_ACQUIRE))
+    IOLog("NativeMsdc attr stopped final_interval_unreported=1\n");
   __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
   __atomic_store_n(&gOverlapTraceEnabled, false, __ATOMIC_RELEASE);
   __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
@@ -218,6 +221,7 @@ static void startReadAttribution(IOService *owner, bool enabled, bool trace = fa
   if (!__atomic_compare_exchange_n(&gReadAttributionStarted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
   owner->retain();
   __atomic_store_n(&gOverlapTraceRequested, trace, __ATOMIC_RELEASE);
+  __atomic_store_n(&gReadAttributionRequested, enabled, __ATOMIC_RELEASE);
   __atomic_store_n(&gReadAttributionOwner, owner, __ATOMIC_RELEASE);
   if (enabled || trace) gReadAttributionBegin = attributionNow();
   // One-shot resident reporter: stop is monotonic and cannot be overwritten by start.
