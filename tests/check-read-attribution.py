@@ -65,7 +65,13 @@ recordAttributedBlockRead(0,1,8,100,&buffer,&attributes);assert(!pidCalls&&!attr
 gOverlapTraceEnabled=true;recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
 NativeOverlapTrace::Snapshot trace;assert(gOverlapTrace.drain(trace));
 assert(trace.count==1&&trace.events[0].pid==56&&trace.events[0].tid==123&&trace.events[0].window==1&&trace.events[0].block==17&&trace.events[0].count==8);
-assert(!attrCalls);recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,false);assert(gOverlapTrace.drain(trace)&&trace.count==0);gOverlapTraceEnabled=false;pidCalls=0;clockCalls=0;
+assert(!attrCalls);
+for(unsigned i=0;i<32;i++)recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
+unsigned fullPid=pidCalls,fullClock=clockCalls;
+for(unsigned i=0;i<1000;i++)recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
+assert(pidCalls==fullPid&&clockCalls==fullClock);
+assert(gOverlapTrace.drain(trace)&&trace.count==32&&trace.full==1000);
+recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,false);assert(gOverlapTrace.drain(trace)&&trace.count==0);gOverlapTraceEnabled=false;pidCalls=0;clockCalls=0;
 
 IOService owner,other;startReadAttribution(&owner,false);assert(!clockCalls&&!starts&&owner.refs==1);
 startReadAttribution(&owner,true);assert(gReadAttributionEnabled&&clockCalls==1&&starts==1&&owner.refs==2&&deallocs==1&&pendingContext==&owner&&pendingThread);
@@ -107,6 +113,25 @@ while(done<4){if(table.drain(snap)){uint64_t rows=0;for(auto &r:snap.rows)if(r.u
 for(auto &t:threads){t.join();}
 assert(table.drain(snap));total+=snap.calls+snap.contentionCalls;bytes+=snap.bytes+snap.contentionBytes;
 assert(total==40000&&bytes==40000ULL*4096);
+// Trace-only reporter must not drain or emit attribution records.
+gReadAttributionStarted=false;gReadAttributionOwner=nullptr;gReadAttributionStop=false;failThread=false;
+assert(gReadAttribution.drain(snap));output.clear();logs=0;sleepCalls=0;
+startReadAttribution(&owner,false,true);assert(!gReadAttributionEnabled&&gOverlapTraceEnabled);
+recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
+const unsigned clockBeforeReport=clockCalls;
+pendingThread(pendingContext,0);
+assert(output.find("NativeMsdc overlap event")!=std::string::npos);
+assert(output.find("NativeMsdc attr ")==std::string::npos);
+assert(clockCalls==clockBeforeReport);
+assert(gReadAttribution.drain(snap)&&snap.calls==20);
+// Both streams enabled: each gets its own framed report.
+gReadAttributionStarted=false;gReadAttributionStop=false;sleepCalls=0;output.clear();logs=0;
+startReadAttribution(&owner,true,true);recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
+pendingThread(pendingContext,0);
+assert(output.find("NativeMsdc overlap event")!=std::string::npos && output.find("prequeue=1")!=std::string::npos);
+assert(output.find("NativeMsdc attr row")!=std::string::npos);
+
+
 for(unsigned i=0;i<1000;i++)table.record({i,0,0,0,i+1},1,i);
 assert(table.drain(snap)&&snap.calls==1000&&snap.overflowCalls>0);
 }
@@ -138,7 +163,7 @@ assert 'return false' not in start[start.index('startReadAttribution(this,'):]
 print('PASS reporter body/top12/other/release and block-device-off helper compilation; reporter starts only after failure paths')
 
 name_bound=int(re.search(r'char name\[(\d+)\]',(R/'NativeMsdc.h').read_text()).group(1))
-for text in re.findall(r'IOLog\("(NativeMsdc attr[^"\n]*)"',s):
+for text in re.findall(r'IOLog\("(NativeMsdc (?:attr|overlap)[^"\n]*)"',s):
  line=bytes(text,'utf-8').decode('unicode_escape')
  line=re.sub(r'%llu','9'*20,line);line=re.sub(r'%x','f'*8,line);line=re.sub(r'%u','9'*10,line)
  line=line.replace('%.*s','X'*name_bound)

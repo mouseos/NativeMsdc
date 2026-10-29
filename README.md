@@ -429,16 +429,19 @@ or boot image editing is performed by the driver.
 ### Bounded overlap trace
 
 `native-io-trace=1` enables the same resident reporter without requiring
-`native-msdc-attrib=1`. Only accepted, validated In offers from verified,
-manifest-read-only, non-writable windows are sampled before worker queueing.
-The trace does not include the persistent store, writable windows, completion,
-physical reads or rejected requests. The window legend maps index to name.
+`native-msdc-attrib=1`. Only In offers passing the initial direction, extent
+and descriptor-length checks from verified, manifest-read-only, non-writable
+windows are sampled before worker queueing. The trace excludes the persistent
+store, writable windows, completions, and physical reads. Later queue, completion, online, verification and media checks
+may reject an offer. The window legend maps index to name.
 
 Each 10-second drain emits at most 32 event records (the first 32 admitted in
 that interval), with PID/TID of the submission context, boot-relative
 `mach_absolute_time` in ns, window-relative block/count in 512-byte sectors.
-`full` counts subsequent offers, `contention` counts try-lock failures; they
-are interval counters, but contention is sampled separately. Drain failure
+`full` counts offers dropped after observing saturation; `contention` counts
+try-lock failures. After saturation, timestamps and identities are not fetched.
+Both counters are exact across quiescent drains, but sampled independently; an
+offer racing a drain can be counted in an adjacent interval. Drain failure
 retains the buffer for a later interval. A stopped reporter discards its final
 partial interval. Empty reports are emitted, and reporting itself may perturb
 timing. Never interpret absent overlap as proof of no overlap when data is

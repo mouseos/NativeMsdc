@@ -121,16 +121,19 @@ static void recordAttributedBlockRead(uint32_t window, uint64_t block, uint64_t 
   static_assert(kIOStorageOptionIsStatic == 0x20, "pinned static-content option");
   if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) &&
       !__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) return;
-  if (!buffer || !count) { __atomic_fetch_add(&gReadAttributionSkipped[0], 1ULL, __ATOMIC_RELAXED); return; }
+  if (!buffer || !count) { if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_RELAXED)) __atomic_fetch_add(&gReadAttributionSkipped[0], 1ULL, __ATOMIC_RELAXED); return; }
   // Match the driver exactly: InOut is not a supported read direction.
-  if (buffer->getDirection() != kIODirectionIn) { __atomic_fetch_add(&gReadAttributionSkipped[1], 1ULL, __ATOMIC_RELAXED); return; }
+  if (buffer->getDirection() != kIODirectionIn) { if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_RELAXED)) __atomic_fetch_add(&gReadAttributionSkipped[1], 1ULL, __ATOMIC_RELAXED); return; }
   if (count > UINT64_MAX / 512 || block >= sectors || count > sectors - block) {
-    __atomic_fetch_add(&gReadAttributionSkipped[2], 1ULL, __ATOMIC_RELAXED); return;
+    if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_RELAXED)) __atomic_fetch_add(&gReadAttributionSkipped[2], 1ULL, __ATOMIC_RELAXED);
+    return;
   }
-  if (buffer->getLength() < count * 512) { __atomic_fetch_add(&gReadAttributionSkipped[3], 1ULL, __ATOMIC_RELAXED); return; }
+  if (buffer->getLength() < count * 512) { if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_RELAXED)) __atomic_fetch_add(&gReadAttributionSkipped[3], 1ULL, __ATOMIC_RELAXED); return; }
   if (traceEligible && __atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) {
-    gOverlapTrace.record({attributionNow(), thread_tid(current_thread()), block, count,
-                          static_cast<uint32_t>(proc_selfpid()), window});
+    gOverlapTrace.record([&] {
+      return NativeOverlapTrace::Event{attributionNow(), thread_tid(current_thread()), block, count,
+                                      static_cast<uint32_t>(proc_selfpid()), window};
+    });
   }
   if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE)) return;
   uint32_t flags = 0;
@@ -156,7 +159,7 @@ static void readAttributionThread(void *context, wait_result_t) {
     if (__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE) && gOverlapTrace.drain(gOverlapTraceSnapshot)) {
       auto &trace = gOverlapTraceSnapshot;
       ++traceSequence;
-      IOLog("NativeMsdc overlap begin seq=%llu count=%llu full=%llu contention=%llu unit=512\n",
+      IOLog("NativeMsdc overlap begin seq=%llu count=%llu full=%llu contention=%llu unit=512 prequeue=1\n",
             u64(traceSequence), u64(trace.count), u64(trace.full), u64(trace.contention));
       for (uint64_t i = 0; i < trace.count; ++i) {
         const auto &e = trace.events[i];
@@ -165,6 +168,7 @@ static void readAttributionThread(void *context, wait_result_t) {
       }
       IOLog("NativeMsdc overlap end seq=%llu\n", u64(traceSequence));
     }
+    if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE)) continue;
     const uint64_t sampleBegin = attributionNow();
     if (!gReadAttribution.drain(gReadAttributionSnapshot)) continue;
     const uint64_t end = attributionNow();
@@ -208,7 +212,7 @@ static void startReadAttribution(IOService *owner, bool enabled, bool trace = fa
   if (!__atomic_compare_exchange_n(&gReadAttributionStarted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
   owner->retain();
   __atomic_store_n(&gReadAttributionOwner, owner, __ATOMIC_RELEASE);
-  gReadAttributionBegin = attributionNow();
+  if (enabled) gReadAttributionBegin = attributionNow();
   // One-shot resident reporter: stop is monotonic and cannot be overwritten by start.
   if (owner->isInactive() || __atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) {
     __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
