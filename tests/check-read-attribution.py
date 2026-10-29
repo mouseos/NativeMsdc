@@ -152,6 +152,8 @@ with tempfile.TemporaryDirectory() as d:
  subprocess.run([str(p/'off')],check=True)
 assert 'IOLog' not in hook and 'retain' not in hook and 'mach_absolute_time' not in hook
 entry=s[s.index('IOReturn NativeMsdcBlock::doAsyncReadWrite'):s.index('IOReturn NativeMsdcBlock::readWriteNow')]
+assert entry.index('recordAttributedBlockRead')<entry.index('if (!accepting) return kIOReturnNotReady')
+assert entry.index('recordAttributedBlockRead')<entry.index('if (!completion || !completion->action) return kIOReturnBadArgument')
 assert entry.index('recordAttributedBlockRead')<entry.index('BlockJob *job')
 assert 'bootArgument("native-msdc-attribution", 1, 0) == 1' in s
 assert 'bootArgument("native-msdc-attrib", 1, 0) == 1' in s
