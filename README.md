@@ -425,3 +425,22 @@ diagnostic selector without deleting functional boot arguments. That switches
 away from iostat/CPU-load fallback reporting and is a diagnostic-profile change,
 not a strict single-variable performance comparison. No automatic replacement
 or boot image editing is performed by the driver.
+
+### Bounded overlap trace
+
+`native-io-trace=1` enables the same resident reporter without requiring
+`native-msdc-attrib=1`. Only accepted, validated In offers from verified,
+manifest-read-only, non-writable windows are sampled before worker queueing.
+The trace does not include the persistent store, writable windows, completion,
+physical reads or rejected requests. The window legend maps index to name.
+
+Each 10-second drain emits at most 32 event records (the first 32 admitted in
+that interval), with PID/TID of the submission context, boot-relative
+`mach_absolute_time` in ns, window-relative block/count in 512-byte sectors.
+`full` counts subsequent offers, `contention` counts try-lock failures; they
+are interval counters, but contention is sampled separately. Drain failure
+retains the buffer for a later interval. A stopped reporter discards its final
+partial interval. Empty reports are emitted, and reporting itself may perturb
+timing. Never interpret absent overlap as proof of no overlap when data is
+sampled or lost. This diagnostic exposes block ranges, which can identify data
+on a known image; it never emits data bytes or process names.

@@ -87,6 +87,7 @@ extern const uint8_t verified_root_key[];         // the owner key, VR_KEY_BYTES
 #endif
 #include "NativeMsdc.h"
 #include "NativeReadAttribution.h"
+#include "NativeOverlapTrace.h"
 #include <sys/proc.h>
 #include <sys/buf.h>
 
@@ -99,6 +100,10 @@ IOService *gReadAttributionOwner = nullptr;
 NativeReadAttribution::Table gReadAttribution;
 NativeReadAttribution::Snapshot gReadAttributionSnapshot; // reporter only; not kernel stack
 uint64_t gReadAttributionBegin;
+bool gOverlapTraceEnabled = false;
+NativeOverlapTrace::Buffer gOverlapTrace;
+NativeOverlapTrace::Snapshot gOverlapTraceSnapshot; // reporter only
+
 uint64_t gReadAttributionSkipped[4] = {};
 static uint64_t attributionNow() {
   uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns;
@@ -110,11 +115,12 @@ static void recordAttributedRead(uint32_t window, uint32_t flags, uint64_t bytes
 }
 #if NATIVE_MSDC_BLOCK_DEVICES
 static void recordAttributedBlockRead(uint32_t window, uint64_t block, uint64_t count,
-                                      uint64_t sectors, IOMemoryDescriptor *buffer, IOStorageAttributes *attributes) {
+                                      uint64_t sectors, IOMemoryDescriptor *buffer, IOStorageAttributes *attributes, bool traceEligible = false) {
   static_assert(sizeof(IOStorageAttributes) == 32 && __builtin_offsetof(IOStorageAttributes, bufattr) == 24,
                 "read attribution requires the pinned IOStorageFamily attributes ABI");
   static_assert(kIOStorageOptionIsStatic == 0x20, "pinned static-content option");
-  if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE)) return;
+  if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) &&
+      !__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) return;
   if (!buffer || !count) { __atomic_fetch_add(&gReadAttributionSkipped[0], 1ULL, __ATOMIC_RELAXED); return; }
   // Match the driver exactly: InOut is not a supported read direction.
   if (buffer->getDirection() != kIODirectionIn) { __atomic_fetch_add(&gReadAttributionSkipped[1], 1ULL, __ATOMIC_RELAXED); return; }
@@ -122,6 +128,11 @@ static void recordAttributedBlockRead(uint32_t window, uint64_t block, uint64_t 
     __atomic_fetch_add(&gReadAttributionSkipped[2], 1ULL, __ATOMIC_RELAXED); return;
   }
   if (buffer->getLength() < count * 512) { __atomic_fetch_add(&gReadAttributionSkipped[3], 1ULL, __ATOMIC_RELAXED); return; }
+  if (traceEligible && __atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) {
+    gOverlapTrace.record({attributionNow(), thread_tid(current_thread()), block, count,
+                          static_cast<uint32_t>(proc_selfpid()), window});
+  }
+  if (!__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE)) return;
   uint32_t flags = 0;
   if (attributes) {
     if (attributes->options & kIOStorageOptionIsStatic) flags |= 16;
@@ -137,11 +148,23 @@ static void recordAttributedBlockRead(uint32_t window, uint64_t block, uint64_t 
 #endif
 static void readAttributionThread(void *context, wait_result_t) {
   IOService *owner = static_cast<IOService *>(context);
-  uint64_t begin = gReadAttributionBegin, sequence = 0;
+  uint64_t begin = gReadAttributionBegin, sequence = 0, traceSequence = 0;
   const auto u64 = [](uint64_t value) { return static_cast<unsigned long long>(value); };
   while (!__atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) {
     IOSleep(10000);
     if (__atomic_load_n(&gReadAttributionStop, __ATOMIC_ACQUIRE)) break;
+    if (__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE) && gOverlapTrace.drain(gOverlapTraceSnapshot)) {
+      auto &trace = gOverlapTraceSnapshot;
+      ++traceSequence;
+      IOLog("NativeMsdc overlap begin seq=%llu count=%llu full=%llu contention=%llu unit=512\n",
+            u64(traceSequence), u64(trace.count), u64(trace.full), u64(trace.contention));
+      for (uint64_t i = 0; i < trace.count; ++i) {
+        const auto &e = trace.events[i];
+        IOLog("NativeMsdc overlap event seq=%llu index=%llu ns=%llu pid=%u tid=%llu window=%u block=%llu count=%llu\n",
+              u64(traceSequence), u64(i), u64(e.ns), e.pid, u64(e.tid), e.window, u64(e.block), u64(e.count));
+      }
+      IOLog("NativeMsdc overlap end seq=%llu\n", u64(traceSequence));
+    }
     const uint64_t sampleBegin = attributionNow();
     if (!gReadAttribution.drain(gReadAttributionSnapshot)) continue;
     const uint64_t end = attributionNow();
@@ -175,11 +198,12 @@ static void readAttributionThread(void *context, wait_result_t) {
     begin = end;
   }
   __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&gOverlapTraceEnabled, false, __ATOMIC_RELEASE);
   __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
   owner->release();
 }
-static void startReadAttribution(IOService *owner, bool enabled) {
-  if (!enabled || owner->isInactive()) return;
+static void startReadAttribution(IOService *owner, bool enabled, bool trace = false) {
+  if ((!enabled && !trace) || owner->isInactive()) return;
   bool expected = false;
   if (!__atomic_compare_exchange_n(&gReadAttributionStarted, &expected, true, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
   owner->retain();
@@ -190,10 +214,12 @@ static void startReadAttribution(IOService *owner, bool enabled) {
     __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE);
     owner->release(); return;
   }
-  __atomic_store_n(&gReadAttributionEnabled, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&gReadAttributionEnabled, enabled, __ATOMIC_RELEASE);
+  __atomic_store_n(&gOverlapTraceEnabled, trace, __ATOMIC_RELEASE);
   thread_t thread = nullptr;
   if (kernel_thread_start(readAttributionThread, owner, &thread) != KERN_SUCCESS) {
     __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
+    __atomic_store_n(&gOverlapTraceEnabled, false, __ATOMIC_RELEASE);
     __atomic_store_n(&gReadAttributionStop, true, __ATOMIC_RELEASE);
     __atomic_store_n(&gReadAttributionOwner, static_cast<IOService *>(nullptr), __ATOMIC_RELEASE); owner->release();
     IOLog("NativeMsdc attr unavailable: reporter thread\n"); return;
@@ -203,6 +229,7 @@ static void startReadAttribution(IOService *owner, bool enabled) {
 static void stopReadAttribution(IOService *owner) {
   if (__atomic_load_n(&gReadAttributionOwner, __ATOMIC_ACQUIRE) != owner) return;
   __atomic_store_n(&gReadAttributionEnabled, false, __ATOMIC_RELEASE);
+  __atomic_store_n(&gOverlapTraceEnabled, false, __ATOMIC_RELEASE);
   __atomic_store_n(&gReadAttributionStop, true, __ATOMIC_RELEASE);
 }
 }
@@ -1573,7 +1600,12 @@ IOReturn NativeMsdcBlock::synchronizeNow ()
 IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                             IOStorageAttributes *attributes, IOStorageCompletion *completion)
 {
-  recordAttributedBlockRead(window, block, count, sectors, buffer, attributes);
+  bool traceEligible = false;
+#if NATIVE_MSDC_VERIFIED
+  if (__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE))
+    traceEligible = verifiedActive && manifestReadOnly && !writable;
+#endif
+  recordAttributedBlockRead(window, block, count, sectors, buffer, attributes, traceEligible);
   // Offered block requests, not completions: later validation, verification,
   // queue saturation or media errors can change the outcome. These existing
   // counters do not record identity; the optional hook above is separate.
@@ -2196,8 +2228,10 @@ bool NativeMsdc::start (IOService *provider)
   // No failure return remains after the reporter takes its service reference.
   const bool attributeReads = bootArgument("native-msdc-attribution", 1, 0) == 1 ||
                               bootArgument("native-msdc-attrib", 1, 0) == 1;
-  startReadAttribution(this, attributeReads);
-  if (__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) && gHost.manifestValid)
+  const bool overlapTrace = bootArgument("native-io-trace", 1, 0) == 1;
+  startReadAttribution(this, attributeReads, overlapTrace);
+  if ((__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) ||
+       __atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) && gHost.manifestValid)
     for (unsigned index = 0; index < gHost.manifest.count; ++index)
       IOLog("NativeMsdc attr window index=%u name=%.*s\n", index, int(sizeof(gHost.manifest.window[index].name)), gHost.manifest.window[index].name);
   return true;

@@ -9,6 +9,7 @@ lifecycle=s[a:b]
 reporter=s[s.index('static void readAttributionThread('):s.index('static void startReadAttribution(')]
 source=r'''
 #include "NativeReadAttribution.h"
+#include "NativeOverlapTrace.h"
 #include <cassert>
 #include <thread>
 #include <vector>
@@ -22,6 +23,10 @@ static_assert(sizeof(constantTable)==sizeof(NativeReadAttribution::Table),"const
 static_assert(std::is_trivially_destructible<NativeReadAttribution::Table>::value,"no teardown initializer");
 static bool gReadAttributionEnabled=false,gReadAttributionStop=false,gReadAttributionStarted=false;
 static NativeReadAttribution::Table gReadAttribution;
+static bool gOverlapTraceEnabled=false;
+static NativeOverlapTrace::Buffer gOverlapTrace;
+static NativeOverlapTrace::Snapshot gOverlapTraceSnapshot;
+static uint64_t attributionNow();
 static unsigned pidCalls=0,attrCalls=0,meta=0,passive=0,nocache=0;
 static uint64_t gReadAttributionSkipped[4]={};
 static void *current_thread(){return nullptr;}
@@ -57,6 +62,11 @@ LIFECYCLE
 int main(){
 IOMemoryDescriptor buffer;IOStorageAttributes attributes;
 recordAttributedBlockRead(0,1,8,100,&buffer,&attributes);assert(!pidCalls&&!attrCalls);
+gOverlapTraceEnabled=true;recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,true);
+NativeOverlapTrace::Snapshot trace;assert(gOverlapTrace.drain(trace));
+assert(trace.count==1&&trace.events[0].pid==56&&trace.events[0].tid==123&&trace.events[0].window==1&&trace.events[0].block==17&&trace.events[0].count==8);
+assert(!attrCalls);recordAttributedBlockRead(1,17,8,100,&buffer,&attributes,false);assert(gOverlapTrace.drain(trace)&&trace.count==0);gOverlapTraceEnabled=false;pidCalls=0;clockCalls=0;
+
 IOService owner,other;startReadAttribution(&owner,false);assert(!clockCalls&&!starts&&owner.refs==1);
 startReadAttribution(&owner,true);assert(gReadAttributionEnabled&&clockCalls==1&&starts==1&&owner.refs==2&&deallocs==1&&pendingContext==&owner&&pendingThread);
 startReadAttribution(&other,true);assert(starts==1&&other.refs==1);
