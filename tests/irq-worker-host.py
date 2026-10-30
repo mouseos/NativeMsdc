@@ -32,10 +32,11 @@ using IODirection=int;constexpr int kIODirectionIn=1,kIODirectionOut=2;constexpr
 bool gIoTimingEnabled=false;uint64_t native_msdc_block_offer_stats[12]{},native_msdc_block_queue_stats[3]{};
 std::atomic<uint64_t> ticks{100};uint64_t mach_absolute_time(){return ticks.fetch_add(100);}void absolutetime_to_nanoseconds(uint64_t t,uint64_t*out){*out=t;}
 struct IOStorageAttributes{unsigned options;};struct IOStorageCompletion{void*target;void(*action)(void*,void*,int,uint64_t);void*parameter;};
-struct IOMemoryDescriptor{int direction=kIODirectionIn;int getDirection(){return direction;}uint8_t data[512]{};uint8_t expected=0;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
-struct IOService{std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
+struct IOMemoryDescriptor{int direction=kIODirectionIn;int getDirection(){return direction;}uint64_t getLength(){return sizeof(data);}uint8_t data[512]{};uint8_t expected=0;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}};
+struct IOService{std::atomic<int> refs{1};bool isInactive(){return false;}void retain(){refs++;}void release(){refs--;}};
 // Attribution is off in this worker-only fixture; actual recorder tested separately.
-static void recordAttributedBlockRead(uint32_t,uint64_t,uint64_t,uint64_t,IOMemoryDescriptor*,IOStorageAttributes*){}
+static bool gOverlapTraceEnabled=false;
+static void recordAttributedBlockRead(uint32_t,uint64_t,uint64_t,uint64_t,IOMemoryDescriptor*,IOStorageAttributes*,bool){}
 struct NativeMsdcBlock{uint32_t window=0;uint64_t sectors=UINT64_MAX;bool verifiedActive=true,manifestReadOnly=true,writable=false;std::atomic<int> refs{1};void retain(){refs++;}void release(){refs--;}
  int doSynchronizeCache();int synchronizeNow();int readWriteNow(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);
  int doAsyncReadWrite(IOMemoryDescriptor*,UInt64,UInt64,IOStorageAttributes*,IOStorageCompletion*);};
@@ -142,10 +143,32 @@ int main(int argc,char**argv){NativeMsdcBlock owner;IOMemoryDescriptor buffer;IO
  for(int i=0;i<30;i++){assert(owner.doAsyncReadWrite(&buffer,i,1,nullptr,&c)==0);}while(completed!=30){std::this_thread::yield();}stopBlockWorker();joinWorker();
  assert(order.size()==30);for(int i=0;i<30;i++)assert(order[i]==(unsigned)i);assert(owner.refs==1 && buffer.refs==1 && parent.refs==1);assert(owner.doAsyncReadWrite(&buffer,0,1,nullptr,&c)==kIOReturnNotReady);return 0;}
 '''
+if os.environ.get('MSDC_TEST_ADJACENCY') == '1':
+ pre = pre.replace('using UInt64=', '#define MSDC_QUEUE_ADJACENCY_ENABLED 1\n#include "NativeQueueAdjacency.h"\n#include <cstdarg>\n#include <string>\nusing UInt64=', 1)
+ pre = pre.replace('constexpr int kIOReturnSuccess=0,', 'constexpr int kIOReturnNotPrivileged=6;\nconstexpr int kIOReturnSuccess=0,', 1)
+ pre += r'''
+uint64_t attributionNow(){return mach_absolute_time();}
+static unsigned reportSleeps=0; static void (*reportStop)()=nullptr; static std::string reportOutput;
+void IOSleep(unsigned){if(++reportSleeps==2 && reportStop)reportStop();}
+void IOLog(const char *fmt,...){char out[512];va_list ap;va_start(ap,fmt);int n=vsnprintf(out,sizeof(out),fmt,ap);va_end(ap);assert(n>0 && n<=240);reportOutput+=out;}
+'''
+ post = post.replace('int main(int argc,char**argv)', 'void stopReporter(){gAdjacencyStop=true;}\nint main(int argc,char**argv)', 1)
+ post = post.replace(" if(argc>1 && argv[1][0]=='q'){", r'''
+ if(argc>1 && argv[1][0]=='j'){
+  gAdjacencyEnabled=true;assert(owner.doAsyncReadWrite(&buffer,888,1,nullptr,&c)==0);while(!gateEntered)std::this_thread::yield();
+  assert(owner.doAsyncReadWrite(&buffer,1,1,nullptr,&c)==0);assert(owner.doAsyncReadWrite(&buffer,2,1,nullptr,&c)==0);
+  {std::lock_guard<std::mutex> l(gateMutex);gateOpen=true;}gateCv.notify_all();while(completed!=3)std::this_thread::yield();stopBlockWorker();joinWorker();
+  NativeQueueAdjacency::Snapshot s{};IOLockLock(gBlockQueueLock);gAdjacency.drain(s);IOLockUnlock(gBlockQueueLock);
+  assert(s.admitted==3 && s.started==3 && s.success==3 && s.tailPairs==1 && s.adjacent==1 && s.mergeable==1 && s.eventCount==3 && gAdjacencyOffers==3);
+  assert(s.events[1].request.id==2 && s.events[2].request.predecessor==2);
+  gAdjacency.admit(1,4,1,1,0,true,nullptr);reportStop=stopReporter;parent.retain();adjacencyReporter(&parent,0);
+  assert(parent.refs==1 && reportOutput.find("adjacency begin seq=1")!=std::string::npos && reportOutput.find("adjacency end seq=1")!=std::string::npos && reportOutput.find("final_interval_unreported=1")!=std::string::npos);return 0;}
+ if(argc>1 && argv[1][0]=='q'){
+''', 1)
 with tempfile.TemporaryDirectory(prefix='msdc-worker-') as d:
  p=Path(d)/'a.cpp';x=Path(d)/'a';p.write_text(pre+sizebin+queue+sync+asyncfn+post)
- subprocess.run(['c++','-std=c++17','-O2','-Wall','-Wextra','-Werror','-pthread',*shlex.split(os.environ.get('MSDC_TEST_CXXFLAGS','')),str(p),'-o',str(x)],check=True)
- for mode in ('normal','reentry','stop','full','cycle','data','hardware','xstop','ysync','i0','i1','zfail','kstop','qsingle','allocfail','b0','b1','prestop','metrics','vqueue'):
+ subprocess.run(['c++','-I',str(Path(__file__).resolve().parents[1]),'-std=c++17','-O2','-Wall','-Wextra','-Werror','-pthread',*shlex.split(os.environ.get('MSDC_TEST_CXXFLAGS','')),str(p),'-o',str(x)],check=True)
+ for mode in (('j',) if os.environ.get('MSDC_TEST_ADJACENCY') == '1' else ()) + ('normal','reentry','stop','full','cycle','data','hardware','xstop','ysync','i0','i1','zfail','kstop','qsingle','allocfail','b0','b1','prestop','metrics','vqueue'):
   subprocess.run([str(x),mode] if mode!='normal' else [str(x)],check=True,timeout=15)
  print('PASS FIFO/reentry, data snapshots, stop cancellation, full-queue sync and lifetimes')
  print('PASS nested read, returned media credits, saturation polling fallback, and direct I/O stop serialization')

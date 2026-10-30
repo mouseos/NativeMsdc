@@ -88,6 +88,18 @@ extern const uint8_t verified_root_key[];         // the owner key, VR_KEY_BYTES
 #include "NativeMsdc.h"
 #include "NativeReadAttribution.h"
 #include "NativeOverlapTrace.h"
+#ifndef NATIVE_MSDC_QUEUE_ADJACENCY
+#define NATIVE_MSDC_QUEUE_ADJACENCY 0
+#endif
+#if NATIVE_MSDC_QUEUE_ADJACENCY && !(NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_WORKER_EXPERIMENT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_VERIFIED)
+#error "Queue adjacency requires IRQ wait, worker and verified block devices"
+#endif
+#if NATIVE_MSDC_QUEUE_ADJACENCY && NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_WORKER_EXPERIMENT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_VERIFIED
+#include "NativeQueueAdjacency.h"
+#define MSDC_QUEUE_ADJACENCY_ENABLED 1
+#else
+#define MSDC_QUEUE_ADJACENCY_ENABLED 0
+#endif
 #include <sys/proc.h>
 #include <sys/buf.h>
 
@@ -1346,6 +1358,9 @@ struct BlockJob {
   IOReturn completionStatus;
   UInt64 completionBytes;
   bool hasAttributes, completed, ready;
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+  NativeQueueAdjacency::Request adjacency;
+#endif
 };
 struct CompletionSlot { BlockJob *job; bool started, starting; };
 // Each queued request reserves a dedicated completion thread. Threads are
@@ -1361,6 +1376,60 @@ unsigned gBlockQueued = 0, gBlockIoPending = 0, gBlockOutstanding = 0, gBlockDir
 bool gBlockAccept = false, gBlockRunning = false, gBlockEnabled = false;
 bool gBlockPoolShutdown = false, gBlockPoolReady = false, gBlockStartAttempted = false;
 IOService *gBlockParent = nullptr;
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+bool gAdjacencyEnabled = false, gAdjacencyStop = false;
+uint64_t gAdjacencyOffers = 0;
+NativeQueueAdjacency::Collector gAdjacency;
+NativeQueueAdjacency::Snapshot gAdjacencySnapshot; // reporter only, never kernel stack
+
+void adjacencyReporter(void *context, wait_result_t)
+{
+  IOService *owner = static_cast<IOService *>(context);
+  uint64_t seq = 0;
+  auto u = [](uint64_t v) { return static_cast<unsigned long long>(v); };
+  while (!__atomic_load_n(&gAdjacencyStop, __ATOMIC_ACQUIRE)) {
+    IOSleep(10000);
+    if (__atomic_load_n(&gAdjacencyStop, __ATOMIC_ACQUIRE)) break;
+    const uint64_t sample = attributionNow();
+    IOLockLock(gBlockQueueLock);
+    gAdjacency.drain(gAdjacencySnapshot);
+    unsigned depth = gBlockQueued;
+    IOLockUnlock(gBlockQueueLock);
+    const auto &a = gAdjacencySnapshot;
+    uint64_t offers = __atomic_exchange_n(&gAdjacencyOffers, 0ULL, __ATOMIC_RELAXED);
+    IOLog("NativeMsdc adjacency begin seq=%llu ns=%llu offers=%llu queued=%llu invalid=%llu depth=%u non_atomic=1 unit=512\n", u(++seq), u(sample), u(offers), u(a.admitted), u(a.invalid), depth);
+    IOLog("NativeMsdc adjacency pairs seq=%llu tail=%llu adjacent=%llu fit64k=%llu\n", u(seq), u(a.tailPairs), u(a.adjacent), u(a.mergeable));
+    IOLog("NativeMsdc adjacency gaps seq=%llu gap1ms=%llu gap5ms=%llu gap10ms=%llu clock_bad=%llu\n", u(seq), u(a.gap1ms), u(a.gap5ms), u(a.gap10ms), u(a.clockBad));
+    IOLog("NativeMsdc adjacency waits seq=%llu started=%llu ns=%llu max_ns=%llu le1ms=%llu le5ms=%llu le10ms=%llu gt10ms=%llu\n", u(seq), u(a.started), u(a.waitNs), u(a.waitMaxNs), u(a.waits[0]), u(a.waits[1]), u(a.waits[2]), u(a.waits[3]));
+    IOLog("NativeMsdc adjacency results seq=%llu ok=%llu auth_fail=%llu aborted=%llu other_fail=%llu\n", u(seq), u(a.success), u(a.authFailure), u(a.aborted), u(a.otherFailure));
+    IOLog("NativeMsdc adjacency loss seq=%llu partial=%llu events=%llu dropped=%llu\n", u(seq), u(a.partial), u(a.eventCount), u(a.eventDropped));
+    for (uint64_t i=0; i<a.eventCount; ++i) {
+      const auto &e=a.events[i]; const auto &r=e.request;
+      IOLog("NativeMsdc adjacency event seq=%llu id=%llu prev=%llu window=%u block=%llu count=%llu arrival_ns=%llu start_ns=%llu\n", u(seq),u(r.id),u(r.predecessor),r.window,u(r.block),u(r.count),u(r.arrival),u(r.start));
+      IOLog("NativeMsdc adjacency result seq=%llu id=%llu gap_ns=%llu depth=%u adjacent=%u fit64k=%u valid=%u clock_bad=%u status=%d bytes=%llu\n", u(seq),u(r.id),u(r.gap),r.depth,unsigned(r.adjacent),unsigned(r.mergeable),unsigned(r.valid),unsigned(r.clockBad),int(e.status),u(e.completedBytes));
+    }
+    IOLog("NativeMsdc adjacency end seq=%llu\n", u(seq));
+  }
+  IOLog("NativeMsdc adjacency stopped final_interval_unreported=1\n");
+  owner->release();
+}
+void startAdjacencyReporter(IOService *owner)
+{
+  if (!__atomic_load_n(&gBlockQueueLock, __ATOMIC_ACQUIRE)) { IOLog("NativeMsdc adjacency unavailable=no-worker-queue\n"); return; }
+  if (owner->isInactive() || __atomic_load_n(&gAdjacencyStop, __ATOMIC_ACQUIRE)) return;
+  owner->retain();
+  __atomic_store_n(&gAdjacencyEnabled, true, __ATOMIC_RELEASE);
+  if (owner->isInactive() || __atomic_load_n(&gAdjacencyStop, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&gAdjacencyEnabled, false, __ATOMIC_RELEASE); owner->release(); return;
+  }
+  thread_t thread = nullptr;
+  if (kernel_thread_start(adjacencyReporter, owner, &thread) != KERN_SUCCESS) {
+    __atomic_store_n(&gAdjacencyEnabled, false, __ATOMIC_RELEASE);
+    owner->release(); IOLog("NativeMsdc adjacency unavailable=reporter-thread\n"); return;
+  }
+  thread_deallocate(thread);
+}
+#endif
 
 void blockQueueAppend (BlockJob *job)
 {
@@ -1414,6 +1483,9 @@ void blockWorker (void *, wait_result_t)
     if (!gBlockHead) gBlockTail = nullptr;
     --gBlockQueued;
     bool cancelled = !gBlockAccept;
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+    if (job->adjacency.id) gAdjacency.start(job->adjacency, attributionNow());
+#endif
     if (!cancelled && gIoTimingEnabled && job->enqueuedAt) {
       uint64_t elapsed = 0;
       absolutetime_to_nanoseconds (mach_absolute_time () - job->enqueuedAt, &elapsed);
@@ -1432,6 +1504,10 @@ void blockWorker (void *, wait_result_t)
     if (!job->completed) blockCapture (job, nullptr, kIOReturnError, 0);
     __atomic_fetch_add (&native_msdc_worker_stats[1], 1, __ATOMIC_RELAXED);
     IOLockLock (gBlockQueueLock);
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+    if (job->adjacency.id) gAdjacency.finish(job->adjacency, job->completionStatus, job->completionBytes,
+                                             kIOReturnSuccess, kIOReturnNotPrivileged, kIOReturnAborted);
+#endif
     --gBlockIoPending; // media credit is independent of callback lifetime
     job->ready = true;
     IOLockWakeup (gBlockQueueLock, job->slot, false);
@@ -1615,6 +1691,11 @@ IOReturn NativeMsdcBlock::synchronizeNow ()
 IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
                                             IOStorageAttributes *attributes, IOStorageCompletion *completion)
 {
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+  if (__atomic_load_n(&gAdjacencyEnabled, __ATOMIC_ACQUIRE) && verifiedActive && manifestReadOnly && !writable &&
+      buffer && buffer->getDirection() == kIODirectionIn)
+    __atomic_fetch_add(&gAdjacencyOffers, 1ULL, __ATOMIC_RELAXED);
+#endif
   bool traceEligible = false;
 #if NATIVE_MSDC_VERIFIED
   if (__atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE))
@@ -1693,6 +1774,14 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
       return result;
     }
     slot->job = job; job->slot = slot; ++gBlockOutstanding; ++gBlockIoPending;
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+    if (__atomic_load_n(&gAdjacencyEnabled, __ATOMIC_ACQUIRE)) {
+      bool valid = completion && completion->action && count && count <= UINT64_MAX / kSector &&
+                   block < sectors && count <= sectors - block && buffer->getLength() >= count * kSector;
+      const auto *tail = gBlockTail && gBlockTail->adjacency.id ? &gBlockTail->adjacency : nullptr;
+      job->adjacency = gAdjacency.admit(window, block, count, attributionNow(), gBlockQueued, valid, tail);
+    }
+#endif
     job->enqueuedAt = gIoTimingEnabled ? mach_absolute_time () : 0;
     blockQueueAppend (job);
     __atomic_fetch_add (&native_msdc_worker_stats[0], 1, __ATOMIC_RELAXED);
@@ -2245,6 +2334,9 @@ bool NativeMsdc::start (IOService *provider)
                               bootArgument("native-msdc-attrib", 1, 0) == 1;
   const bool overlapTrace = bootArgument("native-io-trace", 1, 0) == 1;
   startReadAttribution(this, attributeReads, overlapTrace);
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+  if (bootArgument("native-msdc-adjacency", 1, 0) == 1) startAdjacencyReporter(this);
+#endif
   if ((__atomic_load_n(&gReadAttributionEnabled, __ATOMIC_ACQUIRE) ||
        __atomic_load_n(&gOverlapTraceEnabled, __ATOMIC_ACQUIRE)) && gHost.manifestValid)
     for (unsigned index = 0; index < gHost.manifest.count; ++index)
@@ -2311,6 +2403,10 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 void NativeMsdc::stop (IOService *provider)
 {
   stopReadAttribution(this);
+#if MSDC_QUEUE_ADJACENCY_ENABLED
+  __atomic_store_n(&gAdjacencyStop, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&gAdjacencyEnabled, false, __ATOMIC_RELEASE);
+#endif
 #if NATIVE_MSDC_BLOCK_DEVICES
   // The normal single-provider IOKit termination path marks this service
   // inactive before stop. Record an unexpected direct/active invocation: its

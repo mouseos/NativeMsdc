@@ -11,7 +11,7 @@ def fun(sig):
 configure=fun('bool NativeMsdcBlock::configure (')
 a=s.index('class VerifiedWindowGuard');b=s.index('\n};',a)+3;guard=s[a:b]
 a=s.index('const char *NativeMsdcBlock::configureVerification');a=s.index('{',a)+1;b=s.index('  if (!gPolicy.storage',a);failed=s[a:b]
-a=s.index('IOReturn NativeMsdcBlock::doAsyncReadWrite');a=s.index('{',a)+1;b=s.index('  if (!buffer ||',a);write=s[a:b]
+a=s.index('IOReturn NativeMsdcBlock::readWriteNow (');a=s.index('#if NATIVE_MSDC_VERIFIED',a);b=s.index('  if (!buffer ||',a);write=s[a:b]
 head=r'''
 #include <cassert>
 #include <cstdint>
@@ -82,7 +82,7 @@ stale=verifiedReadWindow(ops,4096,0,1,bounce,sizeof(bounce),&x.verifiedCache,&ke
 assert(stale.status==2&&!stale.done&&!x.verifiedLock->held);
 delete x.verifiedLock;
 ''')
-source=head+guard+klass+readops+configure+'\nconst char*NativeMsdcBlock::failedVerification(int*status){'+failed+'return "policy rejected";}\nvoid NativeMsdcBlock::attemptedWrite(Buffer*buffer){'+write+'(void)configuration;}\n'+main
+source=head+guard+klass+readops+configure+'\nconst char*NativeMsdcBlock::failedVerification(int*status){'+failed+'return "policy rejected";}\nvoid NativeMsdcBlock::attemptedWrite(Buffer*buffer){\n'+write+'(void)configuration;}\n'+main
 with tempfile.TemporaryDirectory() as t:
  p=Path(t);(p/'t.cpp').write_text(source)
  subprocess.run(['c++','-std=c++17','-O1','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-fno-pie','-no-pie','-I',str(R),str(p/'t.cpp'),'-o',str(p/'t')],check=True)

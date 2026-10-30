@@ -451,3 +451,50 @@ losses are not counted. Empty reports are emitted, and reporting itself may pert
 timing. Never interpret absent overlap as proof of no overlap when data is
 sampled or lost. This diagnostic exposes block ranges, which can identify data
 on a known image; it never emits data bytes or process names.
+
+### Queue adjacency diagnostic (experimental)
+
+`NATIVE_MSDC_QUEUE_ADJACENCY=1` compiles this diagnostic only with verified
+block devices, IRQ wait and the worker experiment. It remains inactive unless
+`native-msdc-adjacency=1` is supplied and a worker queue was prepared. It adds
+no log, clock read, allocation or queue telemetry when disabled. A retained
+reporter drains a fixed aggregate and at most 16 completion examples every ten
+seconds. Reporter creation failure and missing queue are reported. Stop discards
+its last partial interval, including work completed after stop.
+
+Only submitted verified, manifest-read-only, non-writable reads are considered.
+`offers` counts such offers before validation or admission, including direct
+fallback and rejected requests; it is an independent atomic snapshot and can
+cross a report boundary. `queued` counts actual worker-queue admission, including
+invalid requests; `invalid` is a subset. Nothing records other windows, writes,
+store I/O or requests before activation. `depth` is queue length at the drain.
+Admission, start and completion can occur in different reports. Cumulative
+across complete reports only; interrupted/final intervals are unknown.
+
+A queue-locked monotonic boot-local `id` is assigned on admission. `prev` is the
+queue tail at admission (not the active request); it is zero when absent or
+invalid. `tail` counts pairs of individually valid requests; `adjacent` counts
+same-window adjacent block ranges, either order, and `fit64k` is its subset whose
+combined requested sectors fit 128. These are candidates, not proof that a
+merge is safe or that both later succeed. Concurrent queue backlog is evidenced
+by the tail still waiting at admission, not by temporal coincidence. No search
+beyond that one tail is performed. The three gap counters are cumulative bounds
+on adjacent pairs with monotonic timestamps; `clock_bad` counts anomalies.
+Wait buckets describe queue admission to dequeue; the worker/host/verification
+and completion-callback phases are excluded. Timestamps are boot-relative ns.
+
+Results classify completed queued work as success, `kIOReturnNotPrivileged`
+(authentication rejection), aborted, or other failure; `partial` counts returned
+bytes different from the requested length. A success is a successful verified
+read path, which may have used the verified snapshot cache; it is not proof of a
+fresh media read or a new per-block verification. Invalid requests and direct
+fallback are not inferred as authenticated. Events carry request/previous IDs,
+window-relative block/count, admission/dequeue times, queue depth and final
+status/bytes. They are the first 16 completions per report, not a representative
+sample; `dropped` counts omitted completion examples while aggregate counts
+continue. A predecessor can be absent from examples, belong to another report,
+or fail. UART loss and missing final reports are external losses, not reflected
+in `dropped`. No payload bytes or process identity are logged. Counters are
+64-bit and may wrap on very long runs. Instrumentation adds two clock reads and
+bounded updates under the existing queue lock per queued request; reporting
+copies under that lock and logs after unlocking, so it can perturb timing.
