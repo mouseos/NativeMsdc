@@ -452,6 +452,34 @@ timing. Never interpret absent overlap as proof of no overlap when data is
 sampled or lost. This diagnostic exposes block ranges, which can identify data
 on a known image; it never emits data bytes or process names.
 
+### Queue wait predecessor diagnostic (experimental)
+
+Build with `NATIVE_MSDC_WAIT_CAUSE=1` alongside verified block devices, IRQ
+wait and the worker experiment; boot with `native-msdc-wait-cause=1` to enable.
+Both switches default to off. With the boot switch off this adds no clock reads,
+reporter thread or I/O changes. It may be used without adjacency telemetry.
+
+Every non-cancelled queued worker read whose admission-to-dequeue wait exceeds
+10 ms is counted, not sampled. The last worker job is correlated by requested
+size (at most 4 KiB, 4–64 KiB, above 64 KiB), start-to-finish elapsed time
+(at most 1, 5, 10, or above 10 ms), arrival before/during/after that job,
+and queue depth at dequeue including the current request (1, 2, 3–8, 9+).
+The 3×4×3×4 cells are joint counts, emitted every ten seconds with a sequence
+and end marker. The elapsed interval includes scheduling and other overhead;
+it is not a media, DMA, authentication, or CPU-time breakdown. One predecessor
+does not account for all earlier queued work or establish causation. Direct
+fallback, cancelled requests, and pre-activation requests are outside the
+population. A job spanning activation can make its successor's predecessor
+unknown. No block addresses or identities are logged.
+
+`long` equals the sum of cells plus `unknown` and `bad_previous` unless a
+counter saturates (`overflow=1`). `bad_input` counts invalid clock ordering or
+depth before the long-wait threshold can be evaluated. Counters saturate rather
+than wrap. Drains preserve the predecessor across intervals. A missing end
+marker, stop, or interrupted log makes the corresponding interval incomplete;
+the final partial interval is discarded. Reporter logging and the enabled clock
+reads can perturb timing. This is a diagnostic, not a performance improvement.
+
 ### Queue adjacency diagnostic (experimental)
 
 `NATIVE_MSDC_QUEUE_ADJACENCY=1` compiles this diagnostic only with verified

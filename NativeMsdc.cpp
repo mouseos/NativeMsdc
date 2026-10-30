@@ -100,6 +100,15 @@ extern const uint8_t verified_root_key[];         // the owner key, VR_KEY_BYTES
 #else
 #define MSDC_QUEUE_ADJACENCY_ENABLED 0
 #endif
+#ifndef NATIVE_MSDC_WAIT_CAUSE
+#define NATIVE_MSDC_WAIT_CAUSE 0
+#endif
+#if NATIVE_MSDC_WAIT_CAUSE && !(NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_WORKER_EXPERIMENT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_VERIFIED)
+#error "Wait cause requires IRQ wait, worker and verified block devices"
+#endif
+#if NATIVE_MSDC_WAIT_CAUSE
+#include "NativeQueueWaitCause.h"
+#endif
 #include <sys/proc.h>
 #include <sys/buf.h>
 
@@ -1352,6 +1361,10 @@ struct BlockJob {
   IOMemoryDescriptor *buffer;
   UInt64 block, count;
   uint64_t enqueuedAt;
+#if NATIVE_MSDC_WAIT_CAUSE
+  uint64_t causeArrival;
+  bool causeTracked;
+#endif
   IOStorageAttributes attributes;
   IOStorageCompletion completion;
   CompletionSlot *slot;
@@ -1376,6 +1389,54 @@ unsigned gBlockQueued = 0, gBlockIoPending = 0, gBlockOutstanding = 0, gBlockDir
 bool gBlockAccept = false, gBlockRunning = false, gBlockEnabled = false;
 bool gBlockPoolShutdown = false, gBlockPoolReady = false, gBlockStartAttempted = false;
 IOService *gBlockParent = nullptr;
+#if NATIVE_MSDC_WAIT_CAUSE
+bool gWaitCauseEnabled = false, gWaitCauseStop = false;
+NativeQueueWaitCause::Collector gWaitCause;
+NativeQueueWaitCause::Snapshot gWaitCauseSnapshot; // reporter only
+void waitCauseReporter(void *context, wait_result_t)
+{
+  IOService *owner = static_cast<IOService *>(context);
+  uint64_t seq = 0;
+  auto u = [](uint64_t x) { return static_cast<unsigned long long>(x); };
+  while (!__atomic_load_n(&gWaitCauseStop, __ATOMIC_ACQUIRE)) {
+    IOSleep(10000);
+    if (__atomic_load_n(&gWaitCauseStop, __ATOMIC_ACQUIRE)) break;
+    IOLockLock(gBlockQueueLock);
+    gWaitCause.drain(gWaitCauseSnapshot);
+    IOLockUnlock(gBlockQueueLock);
+    const auto &v = gWaitCauseSnapshot;
+    ++seq;
+    IOLog("NativeMsdc waitcause begin seq=%llu ns=%llu long=%llu unknown=%llu bad_input=%llu bad_previous=%llu overflow=%llu before=%llu during=%llu after=%llu\n",
+          u(seq), u(attributionNow()), u(v.longWait), u(v.unknownPrevious), u(v.badInput), u(v.badPrevious), u(v.overflow),
+          u(v.relation[0]), u(v.relation[1]), u(v.relation[2]));
+    for (unsigned size = 0; size < 3; ++size)
+      for (unsigned time = 0; time < 4; ++time)
+        for (unsigned relation = 0; relation < 3; ++relation)
+          IOLog("NativeMsdc waitcause cell seq=%llu size=%u service=%u relation=%u depth1=%llu depth2=%llu depth3_8=%llu depth9plus=%llu\n",
+                u(seq), size, time, relation, u(v.cells[size][time][relation][0]), u(v.cells[size][time][relation][1]),
+                u(v.cells[size][time][relation][2]), u(v.cells[size][time][relation][3]));
+    IOLog("NativeMsdc waitcause end seq=%llu\n", u(seq));
+  }
+  IOLog("NativeMsdc waitcause stopped final_interval_unreported=1\n");
+  owner->release();
+}
+void startWaitCause(IOService *owner)
+{
+  if (!__atomic_load_n(&gBlockQueueLock, __ATOMIC_ACQUIRE)) { IOLog("NativeMsdc waitcause unavailable=no-worker-queue\n"); return; }
+  if (owner->isInactive() || __atomic_load_n(&gWaitCauseStop, __ATOMIC_ACQUIRE)) return;
+  owner->retain();
+  __atomic_store_n(&gWaitCauseEnabled, true, __ATOMIC_RELEASE);
+  if (owner->isInactive() || __atomic_load_n(&gWaitCauseStop, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&gWaitCauseEnabled, false, __ATOMIC_RELEASE); owner->release(); return;
+  }
+  thread_t thread = nullptr;
+  if (kernel_thread_start(waitCauseReporter, owner, &thread) != KERN_SUCCESS) {
+    __atomic_store_n(&gWaitCauseEnabled, false, __ATOMIC_RELEASE);
+    owner->release(); IOLog("NativeMsdc waitcause unavailable=reporter-thread\n"); return;
+  }
+  thread_deallocate(thread);
+}
+#endif
 #if MSDC_QUEUE_ADJACENCY_ENABLED
 bool gAdjacencyEnabled = false, gAdjacencyStop = false;
 uint64_t gAdjacencyOffers = 0;
@@ -1483,6 +1544,11 @@ void blockWorker (void *, wait_result_t)
     if (!gBlockHead) gBlockTail = nullptr;
     --gBlockQueued;
     bool cancelled = !gBlockAccept;
+#if NATIVE_MSDC_WAIT_CAUSE
+    const bool cause = !cancelled && job->causeTracked && __atomic_load_n(&gWaitCauseEnabled, __ATOMIC_ACQUIRE);
+    const uint64_t causeStart = cause ? attributionNow() : 0;
+    if (cause) gWaitCause.dequeue(job->causeArrival, causeStart, gBlockQueued + 1);
+#endif
 #if MSDC_QUEUE_ADJACENCY_ENABLED
     if (job->adjacency.id) gAdjacency.start(job->adjacency, attributionNow());
 #endif
@@ -1503,7 +1569,15 @@ void blockWorker (void *, wait_result_t)
     if (result != kIOReturnSuccess) blockCapture (job, nullptr, result, 0);
     if (!job->completed) blockCapture (job, nullptr, kIOReturnError, 0);
     __atomic_fetch_add (&native_msdc_worker_stats[1], 1, __ATOMIC_RELAXED);
+#if NATIVE_MSDC_WAIT_CAUSE
+    const uint64_t causeEnd = cause ? attributionNow() : 0;
+#endif
     IOLockLock (gBlockQueueLock);
+#if NATIVE_MSDC_WAIT_CAUSE
+    // An untracked/cancelled predecessor is unknown, never reuse older data.
+    if (cause || __atomic_load_n(&gWaitCauseEnabled, __ATOMIC_ACQUIRE))
+      gWaitCause.finished(job->count, causeStart, causeEnd, cause);
+#endif
 #if MSDC_QUEUE_ADJACENCY_ENABLED
     if (job->adjacency.id) gAdjacency.finish(job->adjacency, job->completionStatus, job->completionBytes,
                                              kIOReturnSuccess, kIOReturnNotPrivileged, kIOReturnAborted);
@@ -1781,6 +1855,10 @@ IOReturn NativeMsdcBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 b
       const auto *tail = gBlockTail && gBlockTail->adjacency.id ? &gBlockTail->adjacency : nullptr;
       job->adjacency = gAdjacency.admit(window, block, count, attributionNow(), gBlockQueued, valid, tail);
     }
+#endif
+#if NATIVE_MSDC_WAIT_CAUSE
+    job->causeTracked = __atomic_load_n(&gWaitCauseEnabled, __ATOMIC_ACQUIRE);
+    if (job->causeTracked) job->causeArrival = attributionNow();
 #endif
     job->enqueuedAt = gIoTimingEnabled ? mach_absolute_time () : 0;
     blockQueueAppend (job);
@@ -2329,6 +2407,9 @@ bool NativeMsdc::start (IOService *provider)
   if (activate) scheduleIrqActivation (this, provider, false);
 #endif
 #endif
+#if NATIVE_MSDC_WAIT_CAUSE
+  if (bootArgument("native-msdc-wait-cause", 1, 0) == 1) startWaitCause(this);
+#endif
   // No failure return remains after the reporter takes its service reference.
   const bool attributeReads = bootArgument("native-msdc-attribution", 1, 0) == 1 ||
                               bootArgument("native-msdc-attrib", 1, 0) == 1;
@@ -2403,6 +2484,10 @@ bool NativeMsdc::startRoot (bool allowWrites, const char **why)
 void NativeMsdc::stop (IOService *provider)
 {
   stopReadAttribution(this);
+#if NATIVE_MSDC_WAIT_CAUSE
+  __atomic_store_n(&gWaitCauseStop, true, __ATOMIC_RELEASE);
+  __atomic_store_n(&gWaitCauseEnabled, false, __ATOMIC_RELEASE);
+#endif
 #if MSDC_QUEUE_ADJACENCY_ENABLED
   __atomic_store_n(&gAdjacencyStop, true, __ATOMIC_RELEASE);
   __atomic_store_n(&gAdjacencyEnabled, false, __ATOMIC_RELEASE);
