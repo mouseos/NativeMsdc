@@ -320,6 +320,18 @@ static inline const char *storeWindow (uint64_t partitionSectors, uint64_t image
   return nullptr;
 }
 
+// The boot log window (native-msdc-log=1): the last blocks of userdata, inside the space the Data store reserves at the end
+// (native-msdc-reserve), so it never meets the root windows, the policy region or the store. The UEFI reader of the board
+// and the host decoder derive the same range from the GPT alone: [userdataLast + 1 - blocks * 8, userdataLast].
+static inline const char *logWindow (uint64_t partitionSectors, uint64_t reserveBlocks, uint64_t blocks, uint64_t &firstBlock)
+{
+  uint64_t partition = partitionSectors / kSectorsPerStoreBlock;
+  if (!blocks || partitionSectors % kSectorsPerStoreBlock) return "size";
+  if (blocks > reserveBlocks || reserveBlocks >= partition) return "outside the store reserve";
+  firstBlock = partition - blocks;
+  return nullptr;
+}
+
 // ---- Descriptor DMA (reads) ------------------------------------------------------------------------------------------
 // One GPD (plus the terminating GPD) and one BD describing a single physically contiguous buffer below 4 GiB.
 struct DmaGpd { uint32_t info, next, pointer, length, argument, blocks, command; };

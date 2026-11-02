@@ -2443,6 +2443,58 @@ extern "C" int native_msdc_store_sync (void)
   return hostFlush () == kIOReturnSuccess;
 }
 
+// ---- Boot log window (native-msdc-log=1, default off) -------------------------------------------------------------------
+namespace {
+uint64_t gLogFirstSector, gLogBlocks;
+}
+
+// Returns 1 and the first absolute 512-byte sector of the window, 0 on refusal (reason in *why, may be null).
+extern "C" int native_msdc_log_open (uint64_t blocks, uint64_t *firstSector, const char **why)
+{
+  const char *reason = "";
+  int ok = 0;
+  if (!bootArgument ("native-msdc-log", 1, 0)) reason = "off";
+  else if (!gHost.ready || !gHost.manifestValid || gHost.poisoned) reason = "no root layout";
+  else if (gLogBlocks) reason = "already open";
+  else {
+    HostSession session;
+    uint64_t first = 0;
+    uint64_t sectors = gHost.gpt.userdataLast - gHost.gpt.userdataFirst + 1;
+    if (const char *refused = logWindow (sectors, reserveBlocks (), blocks, first)) reason = refused;
+    else {
+      gLogFirstSector = gHost.gpt.userdataFirst + first * kSectorsPerStoreBlock;
+      gLogBlocks = blocks;
+      if (firstSector) *firstSector = gLogFirstSector;
+      ok = 1;
+    }
+  }
+  if (why) *why = reason;
+  if (ok) IOLog ("NativeMsdc: boot log at sector %llu, %llu blocks\n", gLogFirstSector, gLogBlocks);
+  else IOLog ("NativeMsdc: boot log refused: %s\n", reason);
+  return ok;
+}
+
+// Writes whole 4 KiB blocks inside the open window and flushes the device cache; 0 on any refusal or error.
+extern "C" int native_msdc_log_write (uint64_t relative, uint32_t blocks, const void *source)
+{
+  if (!gLogBlocks || !source || !blocks || relative >= gLogBlocks || blocks > gLogBlocks - relative || gHost.poisoned) return 0;
+  const uint8_t *data = static_cast<const uint8_t *> (source);
+  constexpr uint32_t perTransfer = uint32_t (kMaxBlocks / kSectorsPerStoreBlock);
+  while (blocks) {
+    uint32_t chunk = blocks > perTransfer ? perTransfer : blocks;
+    HostSession session;
+    // transfer() only reads from the buffer on a write.
+    if (transfer (gLogFirstSector + relative * kSectorsPerStoreBlock, uint32_t (chunk * kSectorsPerStoreBlock),
+                  const_cast<uint8_t *> (data), true) != kIOReturnSuccess)
+      return 0;
+    data += chunk * kStoreBlock;
+    relative += chunk;
+    blocks -= chunk;
+  }
+  HostSession session;
+  return hostFlush () == kIOReturnSuccess;
+}
+
 // Re-read the GPT header and entry array and compare their CRCs with those recorded at start. 0 = unchanged.
 extern "C" unsigned native_msdc_store_gpt_check (void)
 {

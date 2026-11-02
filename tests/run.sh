@@ -6,3 +6,5 @@ out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 ${CXX:-c++} -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined "$here/VerifiedPolicyTests.cpp" -o "$out/verified-policy"
 "$out/verified-policy"
+${CXX:-c++} -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined "$here/BootLogWindowTests.cpp" -o "$out/boot-log-window"
+"$out/boot-log-window"
