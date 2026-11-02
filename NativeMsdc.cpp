@@ -2446,21 +2446,50 @@ extern "C" int native_msdc_store_sync (void)
 // ---- Boot log window (native-msdc-log=1, default off) -------------------------------------------------------------------
 namespace {
 uint64_t gLogFirstSector, gLogBlocks;
-}
 
-// Returns 1 and the first absolute 512-byte sector of the window, 0 on refusal (reason in *why, may be null).
+bool logTransfer (uint64_t relative, uint32_t blocks, uint8_t *data, bool write)
+{
+  if (!gLogBlocks || !data || !blocks || relative >= gLogBlocks || blocks > gLogBlocks - relative || gHost.poisoned) return false;
+  constexpr uint32_t perTransfer = uint32_t (kMaxBlocks / kSectorsPerStoreBlock);
+  while (blocks) {
+    uint32_t chunk = blocks > perTransfer ? perTransfer : blocks;
+    HostSession session;
+    // transfer() only reads from the buffer on a write.
+    if (transfer (gLogFirstSector + relative * kSectorsPerStoreBlock, uint32_t (chunk * kSectorsPerStoreBlock), data,
+                  write) != kIOReturnSuccess)
+      return false;
+    data += chunk * kStoreBlock;
+    relative += chunk;
+    blocks -= chunk;
+  }
+  return true;
+}
+} // namespace
+
+// Returns 1 and the first absolute 512-byte sector of the window, 0 on refusal (reason in *why, may be null). Only the final
+// refusal of a caller that retries should be logged by that caller; this function logs the opening only.
 extern "C" int native_msdc_log_open (uint64_t blocks, uint64_t *firstSector, const char **why)
 {
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_WORKER_EXPERIMENT
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
   const char *reason = "";
   int ok = 0;
   if (!bootArgument ("native-msdc-log", 1, 0)) reason = "off";
   else if (!gHost.ready || !gHost.manifestValid || gHost.poisoned) reason = "no root layout";
   else if (gLogBlocks) reason = "already open";
   else {
-    HostSession session;
     uint64_t first = 0;
     uint64_t sectors = gHost.gpt.userdataLast - gHost.gpt.userdataFirst + 1;
+    // Like the store, the window stays clear of the root image and the space its signed policy region may use.
+    uint64_t protectedBytes = gHost.manifest.imageBytes;
+#if NATIVE_MSDC_VERIFIED
+    if (policyRegionOffset (gHost.manifest) + kPolicyMaxBytes > protectedBytes)
+      protectedBytes = policyRegionOffset (gHost.manifest) + kPolicyMaxBytes;
+#endif
     if (const char *refused = logWindow (sectors, reserveBlocks (), blocks, first)) reason = refused;
+    else if (first < (protectedBytes + kStoreBlock - 1) / kStoreBlock + kStoreGuardBlocks) reason = "overlaps the root image";
     else {
       gLogFirstSector = gHost.gpt.userdataFirst + first * kSectorsPerStoreBlock;
       gLogBlocks = blocks;
@@ -2470,27 +2499,27 @@ extern "C" int native_msdc_log_open (uint64_t blocks, uint64_t *firstSector, con
   }
   if (why) *why = reason;
   if (ok) IOLog ("NativeMsdc: boot log at sector %llu, %llu blocks\n", gLogFirstSector, gLogBlocks);
-  else IOLog ("NativeMsdc: boot log refused: %s\n", reason);
   return ok;
+}
+
+// Reads whole 4 KiB blocks inside the open window; 0 on any refusal or error.
+extern "C" int native_msdc_log_read (uint64_t relative, uint32_t blocks, void *destination)
+{
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_WORKER_EXPERIMENT
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
+  return logTransfer (relative, blocks, static_cast<uint8_t *> (destination), false);
 }
 
 // Writes whole 4 KiB blocks inside the open window and flushes the device cache; 0 on any refusal or error.
 extern "C" int native_msdc_log_write (uint64_t relative, uint32_t blocks, const void *source)
 {
-  if (!gLogBlocks || !source || !blocks || relative >= gLogBlocks || blocks > gLogBlocks - relative || gHost.poisoned) return 0;
-  const uint8_t *data = static_cast<const uint8_t *> (source);
-  constexpr uint32_t perTransfer = uint32_t (kMaxBlocks / kSectorsPerStoreBlock);
-  while (blocks) {
-    uint32_t chunk = blocks > perTransfer ? perTransfer : blocks;
-    HostSession session;
-    // transfer() only reads from the buffer on a write.
-    if (transfer (gLogFirstSector + relative * kSectorsPerStoreBlock, uint32_t (chunk * kSectorsPerStoreBlock),
-                  const_cast<uint8_t *> (data), true) != kIOReturnSuccess)
-      return 0;
-    data += chunk * kStoreBlock;
-    relative += chunk;
-    blocks -= chunk;
-  }
+#if NATIVE_MSDC_IRQ_WAIT && NATIVE_MSDC_BLOCK_DEVICES && NATIVE_MSDC_WORKER_EXPERIMENT
+  OptionalBlockDirectGuard guard;
+  if (!guard.ok ()) return 0;
+#endif
+  if (!logTransfer (relative, blocks, static_cast<uint8_t *> (const_cast<void *> (source)), true)) return 0;
   HostSession session;
   return hostFlush () == kIOReturnSuccess;
 }
